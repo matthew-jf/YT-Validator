@@ -1,0 +1,7 @@
+# Ignore everything under data, including subdirectories
+data/**
+
+# Allow only the specific file
+!data/export_all_claims_202505211438.tgz
+
+.DS_Store
