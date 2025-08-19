@@ -29,6 +29,7 @@ codes = categories_df['code'].tolist()
 # Define zeroshot_cols and claim_kind outside conditional block
 zeroshot_cols = [f'zeroshot_score_{code}' for code in codes]
 claim_kind = ['VIDEO_MATCHAUDIOVISUAL', 'VIDEO_MATCHVISUAL', 'AUDIO_MATCHAUDIO', 'SHORTS_IN_PRODUCTAUDIO', 'WEB_UPLOAD_BY_OWNERAUDIOVISUAL', 'DESCRIPTIVE_SEARCHAUDIOVISUAL', 'CMS_UPLOADAUDIOVISUAL']
+content_type = ['UGC', 'SONG_UGC', 'PARTNER_UPLOADED']
 
 def add_zeroshot_features(df, batch_size=100):
     df['channel_display_name'] = df['channel_display_name'].fillna('')
@@ -69,13 +70,20 @@ if not os.path.exists('YT.csv'):
         'longest_match',
         'video_duration_sec',
         'verdict',
-        'claim'
+        'claim',
+        'content_type'
     ] + zeroshot_cols]
 
     # One-hot encode claim types
     for s in claim_kind:
         df[s] = np.array(df.claim == s, dtype=int)
     df = df.drop(columns='claim')
+    
+    # One-hot encode content types
+    for ct in content_type:
+        df[ct] = np.array(df.content_type == ct, dtype=int)
+    df = df.drop(columns='content_type')
+    
     df = df.fillna(0)
     df.to_csv('YT.csv', index=False)
 
@@ -110,13 +118,20 @@ df2 = df2[[
     'matching_duration',
     'longest_match',
     'video_duration_sec',
-    'claim'
+    'claim',
+    'content_type'
 ] + zeroshot_cols]
 
 # One-hot encode claim types (using same categories from training)
 for s in claim_kind:
     df2[s] = np.array(df2.claim == s, dtype=int)
 df2 = df2.drop(columns='claim')
+
+# One-hot encode content types
+for ct in content_type:
+    df2[ct] = np.array(df2.content_type == ct, dtype=int)
+df2 = df2.drop(columns='content_type')
+
 df2 = df2.fillna(0)
 
 # Make predictions
