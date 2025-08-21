@@ -10,6 +10,9 @@ from tqdm import tqdm
 import warnings
 import os
 
+# For checking YouTube video availability
+from pytube import YouTube
+
 # Suppress warnings
 warnings.filterwarnings('ignore')
 
@@ -30,6 +33,16 @@ codes = categories_df['code'].tolist()
 zeroshot_cols = [f'zeroshot_score_{code}' for code in codes]
 claim_kind = ['VIDEO_MATCHAUDIOVISUAL', 'VIDEO_MATCHVISUAL', 'AUDIO_MATCHAUDIO', 'SHORTS_IN_PRODUCTAUDIO', 'WEB_UPLOAD_BY_OWNERAUDIOVISUAL', 'DESCRIPTIVE_SEARCHAUDIOVISUAL', 'CMS_UPLOADAUDIOVISUAL']
 content_type = ['UGC', 'SONG_UGC', 'PARTNER_UPLOADED']
+
+# Function to check if a YouTube video is available
+def check_video_available(video_id):
+    try:
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        yt = YouTube(url)
+        _ = yt.title  # Accessing title to trigger fetch
+        return True
+    except Exception:
+        return False
 
 def add_zeroshot_features(df, batch_size=100):
     df['channel_display_name'] = df['channel_display_name'].fillna('')
@@ -108,6 +121,13 @@ df = pandas.read_csv(r"/Users/matthew.jurewicz/Downloads/export_unprocessed_clai
     dtype=dict(views='Int32', matching_duration='Int32', longest_match='Int32', video_duration_sec='Int32'))
 df2 = copy.copy(df)
 
+# Add video availability column (True if available, False if blocked/unavailable)
+if 'video_id' in df.columns:
+    tqdm.pandas(desc="Checking video availability")
+    df['video_available'] = df['video_id'].progress_apply(check_video_available)
+else:
+    df['video_available'] = True  # Default to True if no video_id column
+
 # Add zero-shot features to unprocessed data
 df2 = add_zeroshot_features(df2)
 
@@ -138,6 +158,10 @@ df2 = df2.fillna(0)
 valid = soln.predict_proba(df2)
 valid = valid[:,1]
 df['rating'] = valid
+
+# Set rating to 0 for unavailable videos
+if 'video_available' in df.columns:
+    df.loc[df['video_available'] == False, 'rating'] = 0
 
 # Add zeroshot features to the output dataframe
 for col in zeroshot_cols:
