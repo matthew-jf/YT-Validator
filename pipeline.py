@@ -170,6 +170,9 @@ df['rating'] = valid
 if 'video_available' in df.columns:
     df.loc[df['video_available'] == False, 'rating'] = 0
 
+# Set rating to 0 for licensed assets
+df.loc[df['licensed'] == True, 'rating'] = 0
+
 # Add zeroshot features to the output dataframe
 for col in zeroshot_cols:
     df[col] = df2[col]
