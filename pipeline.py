@@ -116,10 +116,17 @@ for _ in range(4):
     soln = base.clone(soln)
 soln.fit(df, y)
 
+# Load licensed assets
+licensed_df = pandas.read_csv('Licensed.csv')
+licensed_asset_ids = set(licensed_df['asset_id'].dropna().unique())
+
 # Process unprocessed claims
 df = pandas.read_csv(r"/Users/matthew.jurewicz/Downloads/export_unprocessed_claims_202507241337.csv",
     dtype=dict(views='Int32', matching_duration='Int32', longest_match='Int32', video_duration_sec='Int32'))
 df2 = copy.copy(df)
+
+# Add licensed boolean column
+df['licensed'] = df['asset_id'].isin(licensed_asset_ids)
 
 # Add video availability column (True if available, False if blocked/unavailable)
 if 'video_id' in df.columns:
