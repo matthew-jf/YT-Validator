@@ -67,7 +67,7 @@ def add_zeroshot_features(df, batch_size=100):
 
 # Load training data and create YT.csv if it doesn't exist
 if not os.path.exists('YT.csv'):
-    df = pandas.read_csv(r"/Users/matthew.jurewicz/Downloads/export_all_claims_202507241336.csv",
+    df = pandas.read_csv(r"~/Downloads/export_all_claims_202507241336.csv",
         dtype=dict(views='Int32', matching_duration='Int32', longest_match='Int32', video_duration_sec='Int32'))
     df = df[df.verdict != 'U']
     df.verdict = np.array(df.verdict == 'Y', dtype=int)
@@ -103,6 +103,8 @@ if not os.path.exists('YT.csv'):
 # Train model
 df = pandas.read_csv('YT.csv')
 df, y = df.drop(columns='verdict'), df.verdict
+train_columns = df.columns 
+
 soln = neighbors.KNeighborsClassifier(n_neighbors=11, p=1)
 for _ in range(4):
     test = np.random.permutation(len(df))
@@ -121,7 +123,7 @@ licensed_df = pandas.read_csv('Licensed.csv')
 licensed_asset_ids = set(licensed_df['asset_id'].dropna().unique())
 
 # Process unprocessed claims
-df = pandas.read_csv(r"/Users/matthew.jurewicz/Downloads/export_unprocessed_claims_202507241337.csv",
+df = pandas.read_csv(r"~/Downloads/export_unprocessed_claims_202509031526.csv",
     dtype=dict(views='Int32', matching_duration='Int32', longest_match='Int32', video_duration_sec='Int32'))
 df2 = copy.copy(df)
 
@@ -160,6 +162,7 @@ for ct in content_type:
 df2 = df2.drop(columns='content_type')
 
 df2 = df2.fillna(0)
+df2 = df2[train_columns]
 
 # Make predictions
 valid = soln.predict_proba(df2)
@@ -177,4 +180,4 @@ df.loc[df['licensed'] == True, 'rating'] = 0
 for col in zeroshot_cols:
     df[col] = df2[col]
 
-df.to_csv('export_unprocessed_claims_202507241337.csv', index=False)
+df.to_csv('export_unprocessed_claims_202509031526.csv', index=False)
