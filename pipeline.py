@@ -41,7 +41,7 @@ def check_video_available(video_id):
         yt = YouTube(url)
         _ = yt.title  # Accessing title to trigger fetch
         return True
-    except Exception:
+    except Exception as e:
         return False
 
 def add_zeroshot_features(df, batch_size=100):
