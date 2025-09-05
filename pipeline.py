@@ -9,6 +9,7 @@ from transformers import pipeline
 from tqdm import tqdm
 import warnings
 import os
+import time
 
 # For checking YouTube video availability
 from pytube import YouTube
@@ -40,8 +41,10 @@ def check_video_available(video_id):
         url = f"https://www.youtube.com/watch?v={video_id}"
         yt = YouTube(url)
         _ = yt.title  # Accessing title to trigger fetch
+        time.sleep(1)  # Add 1 second delay between requests
         return True
     except Exception as e:
+        time.sleep(1)  # Add 1 second delay even on errors
         return False
 
 def add_zeroshot_features(df, batch_size=100):
