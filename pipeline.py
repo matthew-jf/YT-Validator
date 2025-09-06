@@ -41,10 +41,10 @@ def check_video_available(video_id):
         url = f"https://www.youtube.com/watch?v={video_id}"
         yt = YouTube(url)
         _ = yt.title  # Accessing title to trigger fetch
-        time.sleep(1)  # Add 1 second delay between requests
+        time.sleep(0.5)  # Add 0.5 second delay between requests
         return True
     except Exception as e:
-        time.sleep(1)  # Add 1 second delay even on errors
+        time.sleep(0.5)  # Add 0.5 second delay even on errors
         return False
 
 def add_zeroshot_features(df, batch_size=100):
@@ -124,7 +124,7 @@ licensed_df = pandas.read_csv('Licensed.csv')
 licensed_asset_ids = set(licensed_df['asset_id'].dropna().unique())
 
 # Process unprocessed claims
-df = pandas.read_csv(r"/Users/matthew.jurewicz/Downloads/export_unprocessed_claims_202507241337.csv",
+df = pandas.read_csv(r"/Users/matthew.jurewicz/Downloads/export_unprocessed_claims_202509051550.csv",
     dtype=dict(views='Int32', matching_duration='Int32', longest_match='Int32', video_duration_sec='Int32'))
 df2 = copy.copy(df)
 
@@ -180,4 +180,4 @@ df.loc[df['licensed'] == True, 'rating'] = 0
 for col in zeroshot_cols:
     df[col] = df2[col]
 
-df.to_csv('export_unprocessed_claims_202507241337.csv', index=False)
+df.to_csv('export_unprocessed_claims_202509051550.csv', index=False)
