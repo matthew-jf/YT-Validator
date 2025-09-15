@@ -1,3 +1,5 @@
+import argparse
+from datetime import datetime
 import pandas
 import numpy as np
 from sklearn import (
@@ -41,10 +43,10 @@ def check_video_available(video_id):
         url = f"https://www.youtube.com/watch?v={video_id}"
         yt = YouTube(url)
         _ = yt.title  # Accessing title to trigger fetch
-        time.sleep(0.5)  # Add 0.5 second delay between requests
+        time.sleep(1)  # Add 1 second delay between requests
         return True
     except Exception as e:
-        time.sleep(0.5)  # Add 0.5 second delay even on errors
+        time.sleep(1)  # Add 1 second delay even on errors
         return False
 
 def add_zeroshot_features(df, batch_size=100):
@@ -68,116 +70,132 @@ def add_zeroshot_features(df, batch_size=100):
     
     return df
 
-# Load training data and create YT.csv if it doesn't exist
-if not os.path.exists('YT.csv'):
-    df = pandas.read_csv(r"/Users/matthew.jurewicz/Downloads/export_all_claims_202507241336.csv",
+
+def main(args):
+    
+    # Load training data and create YT.csv if it doesn't exist
+    if not os.path.exists('YT.csv'):
+        df = pandas.read_csv(args.training_data,
+            dtype=dict(views='Int32', matching_duration='Int32', longest_match='Int32', video_duration_sec='Int32'))
+        df = df[df.verdict != 'U']
+        df.verdict = np.array(df.verdict == 'Y', dtype=int)
+
+        # Add zero-shot features to training data
+        df = add_zeroshot_features(df)
+
+        # Create claim feature and select columns
+        df['claim'] = df.claim_origin + df.claim_type
+        df = df[[
+            'views',
+            'matching_duration',
+            'longest_match',
+            'video_duration_sec',
+            'verdict',
+            'claim',
+            'content_type'
+        ] + zeroshot_cols]
+
+        # One-hot encode claim types
+        for s in claim_kind:
+            df[s] = np.array(df.claim == s, dtype=int)
+        df = df.drop(columns='claim')
+        
+        # One-hot encode content types
+        for ct in content_type:
+            df[ct] = np.array(df.content_type == ct, dtype=int)
+        df = df.drop(columns='content_type')
+        
+        df = df.fillna(0)
+        df.to_csv('YT.csv', index=False)
+
+    # Train model
+    df = pandas.read_csv('YT.csv')
+    df, y = df.drop(columns='verdict'), df.verdict
+    soln = neighbors.KNeighborsClassifier(n_neighbors=11, p=1)
+    for _ in range(4):
+        test = np.random.permutation(len(df))
+        test = test[:len(df) // 4]
+        test = np.array([i in test for i in range(len(df))])
+
+        soln.fit(df[~test], y[~test])
+        valid = soln.predict_proba(df[test])
+        valid = valid[:,1]
+        print(sum((valid > 1/2) == y[test]) / sum(test))
+        soln = base.clone(soln)
+    soln.fit(df, y)
+
+    # Load licensed assets
+    licensed_df = pandas.read_csv('Licensed.csv')
+    licensed_asset_ids = set(licensed_df['asset_id'].dropna().unique())
+
+    # Process unprocessed claims
+    df = pandas.read_csv(args.prediction_input,
         dtype=dict(views='Int32', matching_duration='Int32', longest_match='Int32', video_duration_sec='Int32'))
-    df = df[df.verdict != 'U']
-    df.verdict = np.array(df.verdict == 'Y', dtype=int)
+    df2 = copy.copy(df)
 
-    # Add zero-shot features to training data
-    df = add_zeroshot_features(df)
+    # Add licensed boolean column
+    df['licensed'] = df['asset_id'].isin(licensed_asset_ids)
 
-    # Create claim feature and select columns
-    df['claim'] = df.claim_origin + df.claim_type
-    df = df[[
+    # Add video availability column (True if available, False if blocked/unavailable)
+    if 'video_id' in df.columns:
+        tqdm.pandas(desc="Checking video availability")
+        df['video_available'] = df['video_id'].progress_apply(check_video_available)
+    else:
+        df['video_available'] = True  # Default to True if no video_id column
+
+    # Add zero-shot features to unprocessed data
+    df2 = add_zeroshot_features(df2)
+
+    # Prepare features
+    df2['claim'] = df2.claim_origin + df2.claim_type
+    df2 = df2[[
         'views',
         'matching_duration',
         'longest_match',
         'video_duration_sec',
-        'verdict',
         'claim',
         'content_type'
     ] + zeroshot_cols]
 
-    # One-hot encode claim types
+    # One-hot encode claim types (using same categories from training)
     for s in claim_kind:
-        df[s] = np.array(df.claim == s, dtype=int)
-    df = df.drop(columns='claim')
-    
+        df2[s] = np.array(df2.claim == s, dtype=int)
+    df2 = df2.drop(columns='claim')
+
     # One-hot encode content types
     for ct in content_type:
-        df[ct] = np.array(df.content_type == ct, dtype=int)
-    df = df.drop(columns='content_type')
-    
-    df = df.fillna(0)
-    df.to_csv('YT.csv', index=False)
+        df2[ct] = np.array(df2.content_type == ct, dtype=int)
+    df2 = df2.drop(columns='content_type')
 
-# Train model
-df = pandas.read_csv('YT.csv')
-df, y = df.drop(columns='verdict'), df.verdict
-soln = neighbors.KNeighborsClassifier(n_neighbors=11, p=1)
-for _ in range(4):
-    test = np.random.permutation(len(df))
-    test = test[:len(df) // 4]
-    test = np.array([i in test for i in range(len(df))])
+    df2 = df2.fillna(0)
 
-    soln.fit(df[~test], y[~test])
-    valid = soln.predict_proba(df[test])
+    # Make predictions
+    valid = soln.predict_proba(df2)
     valid = valid[:,1]
-    print(sum((valid > 1/2) == y[test]) / sum(test))
-    soln = base.clone(soln)
-soln.fit(df, y)
+    df['rating'] = valid
 
-# Load licensed assets
-licensed_df = pandas.read_csv('Licensed.csv')
-licensed_asset_ids = set(licensed_df['asset_id'].dropna().unique())
+    # Set rating to 0 for unavailable videos
+    if 'video_available' in df.columns:
+        df.loc[df['video_available'] == False, 'rating'] = 0
 
-# Process unprocessed claims
-df = pandas.read_csv(r"/Users/matthew.jurewicz/Downloads/export_unprocessed_claims_202509051550.csv",
-    dtype=dict(views='Int32', matching_duration='Int32', longest_match='Int32', video_duration_sec='Int32'))
-df2 = copy.copy(df)
+    # Set rating to 0 for licensed assets
+    df.loc[df['licensed'] == True, 'rating'] = 0
 
-# Add licensed boolean column
-df['licensed'] = df['asset_id'].isin(licensed_asset_ids)
+    # Add zeroshot features to the output dataframe
+    for col in zeroshot_cols:
+        df[col] = df2[col]
 
-# Add video availability column (True if available, False if blocked/unavailable)
-if 'video_id' in df.columns:
-    tqdm.pandas(desc="Checking video availability")
-    df['video_available'] = df['video_id'].progress_apply(check_video_available)
-else:
-    df['video_available'] = True  # Default to True if no video_id column
+    # Save predictions
+    df.to_csv(args.prediction_output, index=False)
 
-# Add zero-shot features to unprocessed data
-df2 = add_zeroshot_features(df2)
 
-# Prepare features
-df2['claim'] = df2.claim_origin + df2.claim_type
-df2 = df2[[
-    'views',
-    'matching_duration',
-    'longest_match',
-    'video_duration_sec',
-    'claim',
-    'content_type'
-] + zeroshot_cols]
+if __name__ == "__main__":
 
-# One-hot encode claim types (using same categories from training)
-for s in claim_kind:
-    df2[s] = np.array(df2.claim == s, dtype=int)
-df2 = df2.drop(columns='claim')
+    # Setup argument parser
+    parser = argparse.ArgumentParser(description='Process claims data and train classifier')
+    parser.add_argument('--training-data', default='./data/export_all_claims_202505211438.csv', help='Training data CSV')
+    parser.add_argument('--prediction-input', required=True, help='Input CSV for prediction')
+    parser.add_argument('--prediction-output', default=f'export_all_claims_{datetime.now().strftime("%Y%m%d%H%M")}.csv', help='Output CSV')
+    args = parser.parse_args()
 
-# One-hot encode content types
-for ct in content_type:
-    df2[ct] = np.array(df2.content_type == ct, dtype=int)
-df2 = df2.drop(columns='content_type')
-
-df2 = df2.fillna(0)
-
-# Make predictions
-valid = soln.predict_proba(df2)
-valid = valid[:,1]
-df['rating'] = valid
-
-# Set rating to 0 for unavailable videos
-if 'video_available' in df.columns:
-    df.loc[df['video_available'] == False, 'rating'] = 0
-
-# Set rating to 0 for licensed assets
-df.loc[df['licensed'] == True, 'rating'] = 0
-
-# Add zeroshot features to the output dataframe
-for col in zeroshot_cols:
-    df[col] = df2[col]
-
-df.to_csv('export_unprocessed_claims_202509051550.csv', index=False)
+    main(args)
