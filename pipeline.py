@@ -71,10 +71,14 @@ def add_zeroshot_features(df, batch_size=100):
     return df
 
 
-def main(args):
-    
+def main(args, status_callback=None):
+
     # Load training data and create YT.csv if it doesn't exist
     if not os.path.exists('YT.csv'):
+        
+        if status_callback:
+            status_callback("Loading training data")
+    
         df = pandas.read_csv(args.training_data,
             dtype=dict(views='Int32', matching_duration='Int32', longest_match='Int32', video_duration_sec='Int32'))
         df = df[df.verdict != 'U']
@@ -108,6 +112,9 @@ def main(args):
         df = df.fillna(0)
         df.to_csv('YT.csv', index=False)
 
+    if status_callback:
+        status_callback("Training kNN model & cross-validating")
+
     # Train model
     df = pandas.read_csv('YT.csv')
     df, y = df.drop(columns='verdict'), df.verdict
@@ -138,7 +145,10 @@ def main(args):
 
     # Add video availability column (True if available, False if blocked/unavailable)
     if 'video_id' in df.columns:
-        tqdm.pandas(desc="Checking video availability")
+        if status_callback:
+            desc = "Checking video availability"
+            status_callback(desc)
+        tqdm.pandas(desc=desc)
         df['video_available'] = df['video_id'].progress_apply(check_video_available)
     else:
         df['video_available'] = True  # Default to True if no video_id column
@@ -168,6 +178,9 @@ def main(args):
     df2 = df2.drop(columns='content_type')
 
     df2 = df2.fillna(0)
+
+    if status_callback:
+        status_callback("Making predictions")
 
     # Make predictions
     valid = soln.predict_proba(df2)
