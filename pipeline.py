@@ -38,15 +38,15 @@ claim_kind = ['VIDEO_MATCHAUDIOVISUAL', 'VIDEO_MATCHVISUAL', 'AUDIO_MATCHAUDIO',
 content_type = ['UGC', 'SONG_UGC', 'PARTNER_UPLOADED']
 
 # Function to check if a YouTube video is available
-def check_video_available(video_id):
+def check_video_available(video_id, io_rate_limit=1):
     try:
         url = f"https://www.youtube.com/watch?v={video_id}"
         yt = YouTube(url)
         _ = yt.title  # Accessing title to trigger fetch
-        time.sleep(1)  # Add 1 second delay between requests
+        time.sleep(io_rate_limit)  # Add 1 second delay between requests
         return True
     except Exception as e:
-        time.sleep(1)  # Add 1 second delay even on errors
+        time.sleep(io_rate_limit)  # Add 1 second delay even on errors
         return False
 
 def add_zeroshot_features(df, batch_size=100):
@@ -119,16 +119,23 @@ def main(args, status_callback=None):
     df = pandas.read_csv('YT.csv')
     df, y = df.drop(columns='verdict'), df.verdict
     soln = neighbors.KNeighborsClassifier(n_neighbors=11, p=1)
-    for _ in range(4):
-        test = np.random.permutation(len(df))
-        test = test[:len(df) // 4]
-        test = np.array([i in test for i in range(len(df))])
 
-        soln.fit(df[~test], y[~test])
-        valid = soln.predict_proba(df[test])
-        valid = valid[:,1]
-        print(sum((valid > 1/2) == y[test]) / sum(test))
-        soln = base.clone(soln)
+    if not args.skip_validation:
+
+        if status_callback:
+            status_callback("Performing cross-validation")
+        
+        for _ in range(4):
+            test = np.random.permutation(len(df))
+            test = test[:len(df) // 4]
+            test = np.array([i in test for i in range(len(df))])
+
+            soln.fit(df[~test], y[~test])
+            valid = soln.predict_proba(df[test])
+            valid = valid[:,1]
+            print(sum((valid > 1/2) == y[test]) / sum(test))
+            soln = base.clone(soln)
+
     soln.fit(df, y)
 
     # Load licensed assets
@@ -149,7 +156,8 @@ def main(args, status_callback=None):
             desc = "Checking video availability"
             status_callback(desc)
         tqdm.pandas(desc=desc)
-        df['video_available'] = df['video_id'].progress_apply(check_video_available)
+        df['video_available'] = df['video_id'].progress_apply(
+            lambda vid: check_video_available(vid, io_rate_limit=args.io_rate_limit))
     else:
         df['video_available'] = True  # Default to True if no video_id column
 
@@ -209,6 +217,9 @@ if __name__ == "__main__":
     parser.add_argument('--training-data', default='./data/export_all_claims_202505211438.csv', help='Training data CSV')
     parser.add_argument('--prediction-input', required=True, help='Input CSV for prediction')
     parser.add_argument('--prediction-output', default=f'export_all_claims_{datetime.now().strftime("%Y%m%d%H%M")}.csv', help='Output CSV')
+    parser.add_argument('--io-rate-limit',  type=float, default=1, help='Rate limit for I/O operations (seconds)')
+    parser.add_argument('--skip-validation', action='store_true', help='Skip feg. cross-validation, etc.')
+
     args = parser.parse_args()
 
     main(args)

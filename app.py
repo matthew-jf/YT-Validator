@@ -29,7 +29,9 @@ def start_prediction():
     # Create args object
     args = argparse.Namespace(
         prediction_input=data['prediction_input'],
-        prediction_output=data.get('prediction_output', f'output_{task_id}.csv')
+        prediction_output=data.get('prediction_output', f'output_{task_id}.csv'),
+        io_rate_limit=data.get('io_rate_limit', 1),
+        skip_validation=data.get('skip_validation', False)
     )
     
     # Start background task
@@ -80,7 +82,6 @@ def run_prediction(task_id, args):
         print(f"[{current_time}] {status} (elapsed: {elapsed}s)")
         tasks[task_id]['status'] = status
 
-
     try:
         
         from pipeline import main
@@ -95,6 +96,7 @@ def run_prediction(task_id, args):
         tasks[task_id]['csv_path'] = args.prediction_output
         
     except Exception as e:
+        print("Prediction error: ", e)
         tasks[task_id]['status'] = 'failed'
         tasks[task_id]['error'] = str(e)
 

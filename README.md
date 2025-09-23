@@ -21,7 +21,10 @@ Uncompress training data:
 Run with inference data as only required argument:
 
 ```shell
-python pipeline.py --prediction-input /Users/matthew.jurewicz/Downloads/export_unprocessed_claims_202507241337.csv
+python pipeline.py \
+  --prediction-input /Users/matthew.jurewicz/Downloads/export_unprocessed_claims_202507241337.csv
+  --io-rate-limit 0.1 \
+  --skip-validation 
 ```
 
 Fits by default `YT.csv` if found, else requires training data
@@ -41,7 +44,7 @@ python app.py
 ```shell
 curl -X POST http://localhost:3001/predict \
   -H "Content-Type: application/json" \
-  -d '{"prediction_input": "~/Downloads/export_unprocessed_claims_202509031526.csv"}'
+  -d '{"prediction_input": "~/Downloads/export_unprocessed_claims_202509031526.csv", "io_rate_limit": 0.1, "skip_validation": true }'
 ```
 
 3. Get results  
