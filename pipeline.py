@@ -123,6 +123,10 @@ soln.fit(df, y)
 licensed_df = pandas.read_csv('Licensed.csv')
 licensed_asset_ids = set(licensed_df['asset_id'].dropna().unique())
 
+# Load asset to media_component_id mapping
+assets_media_df = pandas.read_csv('assets_single_media_component.csv')
+asset_to_media_component = dict(zip(assets_media_df['asset_id'], assets_media_df['media_component_id']))
+
 # Process unprocessed claims
 df = pandas.read_csv(r"/Users/matthew.jurewicz/Downloads/export_unprocessed_claims_202509051550.csv",
     dtype=dict(views='Int32', matching_duration='Int32', longest_match='Int32', video_duration_sec='Int32'))
@@ -130,6 +134,9 @@ df2 = copy.copy(df)
 
 # Add licensed boolean column
 df['licensed'] = df['asset_id'].isin(licensed_asset_ids)
+
+# Add media_component_id column
+df['media_component_id'] = df['asset_id'].map(asset_to_media_component)
 
 # Add video availability column (True if available, False if blocked/unavailable)
 if 'video_id' in df.columns:
