@@ -47,7 +47,14 @@ curl -X POST http://localhost:3001/predict \
   -d '{"prediction_input": "~/Downloads/export_unprocessed_claims_202509031526.csv", "io_rate_limit": 0.1, "skip_validation": true }'
 ```
 
-3. Get results  
+Eg. response. Note the `task_id`
+
+```json
+{"status":"started","task_id":"0669d93a-22e1-4f7b-942a-89ef8ff2d836"}
+```
+
+
+3. Get results using `task_id`
 
 ```shell
 # Check status  
