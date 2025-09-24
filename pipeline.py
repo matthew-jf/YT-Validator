@@ -12,7 +12,8 @@ import os
 import time
 
 # For checking YouTube video availability
-from pytube import YouTube
+from googleapiclient.discovery import build
+youtube = build('youtube', 'v3', developerKey=os.environ["YT_API_KEY"])
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
@@ -35,17 +36,35 @@ zeroshot_cols = [f'zeroshot_score_{code}' for code in codes]
 claim_kind = ['VIDEO_MATCHAUDIOVISUAL', 'VIDEO_MATCHVISUAL', 'AUDIO_MATCHAUDIO', 'SHORTS_IN_PRODUCTAUDIO', 'WEB_UPLOAD_BY_OWNERAUDIOVISUAL', 'DESCRIPTIVE_SEARCHAUDIOVISUAL', 'CMS_UPLOADAUDIOVISUAL']
 content_type = ['UGC', 'SONG_UGC', 'PARTNER_UPLOADED']
 
-# Function to check if a YouTube video is available
-def check_video_available(video_id):
-    try:
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        yt = YouTube(url)
-        _ = yt.title  # Accessing title to trigger fetch
-        time.sleep(0.5)  # Add 0.5 second delay between requests
-        return True
-    except Exception as e:
-        time.sleep(0.5)  # Add 0.5 second delay even on errors
-        return False
+def check_videos_available_batch(video_ids, youtube_client, io_rate_limit=1.0):
+    """
+    Check video availability in batches of 50 (API limit) 
+    Mark entire batch as unavailable on error
+    Returns dict mapping video_id -> availability (True/False)
+    """
+    results = {}
+    batch_size = 50
+    num_batches = min(int(len(video_ids) / batch_size), 10000) + 1
+    
+    for i in tqdm(range(0, len(video_ids), batch_size), total=num_batches, 
+                  desc="Checking video availability"):
+        batch = video_ids[i:i + batch_size]
+        
+        try:
+            request = youtube_client.videos().list(part="id", id=','.join(batch))
+            response = request.execute()
+            found_ids = {item['id'] for item in response.get('items', [])}
+            
+            for video_id in batch:
+                results[video_id] = video_id in found_ids
+                
+        except Exception as e:
+            for video_id in batch:
+                results[video_id] = False
+        
+        time.sleep(io_rate_limit)
+    
+    return results
 
 def add_zeroshot_features(df, batch_size=100):
     df['channel_display_name'] = df['channel_display_name'].fillna('')
@@ -107,16 +126,16 @@ if not os.path.exists('YT.csv'):
 df = pandas.read_csv('YT.csv')
 df, y = df.drop(columns='verdict'), df.verdict
 soln = neighbors.KNeighborsClassifier(n_neighbors=11, p=1)
-for _ in range(4):
-    test = np.random.permutation(len(df))
-    test = test[:len(df) // 4]
-    test = np.array([i in test for i in range(len(df))])
+# for _ in range(4):
+#     test = np.random.permutation(len(df))
+#     test = test[:len(df) // 4]
+#     test = np.array([i in test for i in range(len(df))])
 
-    soln.fit(df[~test], y[~test])
-    valid = soln.predict_proba(df[test])
-    valid = valid[:,1]
-    print(sum((valid > 1/2) == y[test]) / sum(test))
-    soln = base.clone(soln)
+#     soln.fit(df[~test], y[~test])
+#     valid = soln.predict_proba(df[test])
+#     valid = valid[:,1]
+#     print(sum((valid > 1/2) == y[test]) / sum(test))
+#     soln = base.clone(soln)
 soln.fit(df, y)
 
 # Load licensed assets
@@ -133,8 +152,9 @@ df['licensed'] = df['asset_id'].isin(licensed_asset_ids)
 
 # Add video availability column (True if available, False if blocked/unavailable)
 if 'video_id' in df.columns:
+    available_map = check_videos_available_batch(df['video_id'].tolist(), youtube, io_rate_limit=.1)
     tqdm.pandas(desc="Checking video availability")
-    df['video_available'] = df['video_id'].progress_apply(check_video_available)
+    df['video_available'] = df['video_id'].map(available_map)
 else:
     df['video_available'] = True  # Default to True if no video_id column
 

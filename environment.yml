@@ -1,7 +1,8 @@
-name: YT-Validator
+name: YT-Validator-TEST
 channels:
   - defaults
 dependencies:
+  - conda-forge::google-api-python-client
   - bzip2=1.0.8=h80987f9_6
   - ca-certificates=2025.2.25=hca03da5_0
   - expat=2.7.1=h313beb8_0
