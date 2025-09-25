@@ -126,21 +126,25 @@ if not os.path.exists('YT.csv'):
 df = pandas.read_csv('YT.csv')
 df, y = df.drop(columns='verdict'), df.verdict
 soln = neighbors.KNeighborsClassifier(n_neighbors=11, p=1)
-# for _ in range(4):
-#     test = np.random.permutation(len(df))
-#     test = test[:len(df) // 4]
-#     test = np.array([i in test for i in range(len(df))])
+for _ in range(4):
+    test = np.random.permutation(len(df))
+    test = test[:len(df) // 4]
+    test = np.array([i in test for i in range(len(df))])
 
-#     soln.fit(df[~test], y[~test])
-#     valid = soln.predict_proba(df[test])
-#     valid = valid[:,1]
-#     print(sum((valid > 1/2) == y[test]) / sum(test))
-#     soln = base.clone(soln)
+    soln.fit(df[~test], y[~test])
+    valid = soln.predict_proba(df[test])
+    valid = valid[:,1]
+    print(sum((valid > 1/2) == y[test]) / sum(test))
+    soln = base.clone(soln)
 soln.fit(df, y)
 
 # Load licensed assets
 licensed_df = pandas.read_csv('Licensed.csv')
 licensed_asset_ids = set(licensed_df['asset_id'].dropna().unique())
+
+# Load asset to media_component_id mapping
+assets_media_df = pandas.read_csv('assets_single_media_component.csv')
+asset_to_media_component = dict(zip(assets_media_df['asset_id'], assets_media_df['media_component_id']))
 
 # Process unprocessed claims
 df = pandas.read_csv(r"/Users/matthew.jurewicz/Downloads/export_unprocessed_claims_202509051550.csv",
@@ -149,6 +153,9 @@ df2 = copy.copy(df)
 
 # Add licensed boolean column
 df['licensed'] = df['asset_id'].isin(licensed_asset_ids)
+
+# Add media_component_id column
+df['media_component_id'] = df['asset_id'].map(asset_to_media_component)
 
 # Add video availability column (True if available, False if blocked/unavailable)
 if 'video_id' in df.columns:
