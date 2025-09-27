@@ -16,6 +16,12 @@ Uncompress training data:
 7z x YT.csv.7z
 ```
 
+Export required envs:
+
+```shell
+YT_API_KEY=AIza... 
+```
+
 ## CLI 
 
 Run with inference data as only required argument:
@@ -23,7 +29,6 @@ Run with inference data as only required argument:
 ```shell
 python pipeline.py \
   --prediction-input /Users/matthew.jurewicz/Downloads/export_unprocessed_claims_202507241337.csv
-  --io-rate-limit 0.1 \
   --skip-validation 
 ```
 
@@ -33,7 +38,7 @@ eg. `--training-data /Users/matthew.jurewicz/Downloads/export_all_claims_2025072
 
 ## API
 
-1. Start server
+1. Start server:
 
 ```shell
 python app.py
@@ -43,8 +48,8 @@ python app.py
 
 ```shell
 curl -X POST http://localhost:3001/predict \
-  -H "Content-Type: application/json" \
-  -d '{"prediction_input": "~/Downloads/export_unprocessed_claims_202509031526.csv", "io_rate_limit": 0.1, "skip_validation": true }'
+  -F "file=@$HOME/Downloads/export_unprocessed_claims_202509031526.csv" \
+  -F "skip_validation=true"
 ```
 
 Eg. response. Note the `task_id`

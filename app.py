@@ -14,9 +14,6 @@ tasks = {}
 @app.route('/predict', methods=['POST'])
 def start_prediction():
 
-    data = request.json
-    print("Received prediction request", data)
-
     task_id = str(uuid.uuid4())
     tasks[task_id] = {
         'status': 'running',
@@ -25,14 +22,24 @@ def start_prediction():
         'csv_path': None
     }
 
+    if 'file' not in request.files:
+        tasks[task_id]['status'] = 'failed'
+        tasks[task_id]['error'] = 'No file part in request'
+        return jsonify(tasks[task_id]), 400
 
-    # Create args object
+    # Save received file
+    file = request.files['file']
+    csv_path = f"data/input_{task_id}.csv"
+    file.save(csv_path)
+
+    # Extract additional args  
     args = argparse.Namespace(
-        prediction_input=data['prediction_input'],
-        prediction_output=data.get('prediction_output', f'output_{task_id}.csv'),
-        io_rate_limit=data.get('io_rate_limit', 1),
-        skip_validation=data.get('skip_validation', False)
+        prediction_input=csv_path,
+        prediction_output=request.form.get('prediction_output', f"data/output_{task_id}.csv"),
+        skip_validation=request.form.get('skip_validation', 'false').lower() == 'true'
     )
+
+    print(f"Received prediction request: {file.filename}", args)
     
     # Start background task
     thread = threading.Thread(target=run_prediction, args=(task_id, args))

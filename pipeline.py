@@ -14,7 +14,8 @@ import os
 import time
 
 # For checking YouTube video availability
-from pytube import YouTube
+from googleapiclient.discovery import build
+youtube = build('youtube', 'v3', developerKey=os.environ["YT_API_KEY"])
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
@@ -37,17 +38,34 @@ zeroshot_cols = [f'zeroshot_score_{code}' for code in codes]
 claim_kind = ['VIDEO_MATCHAUDIOVISUAL', 'VIDEO_MATCHVISUAL', 'AUDIO_MATCHAUDIO', 'SHORTS_IN_PRODUCTAUDIO', 'WEB_UPLOAD_BY_OWNERAUDIOVISUAL', 'DESCRIPTIVE_SEARCHAUDIOVISUAL', 'CMS_UPLOADAUDIOVISUAL']
 content_type = ['UGC', 'SONG_UGC', 'PARTNER_UPLOADED']
 
-# Function to check if a YouTube video is available
-def check_video_available(video_id, io_rate_limit=1):
-    try:
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        yt = YouTube(url)
-        _ = yt.title  # Accessing title to trigger fetch
-        time.sleep(io_rate_limit)  # Add 1 second delay between requests
-        return True
-    except Exception as e:
-        time.sleep(io_rate_limit)  # Add 1 second delay even on errors
-        return False
+# Function to check if YouTube videos are available
+def check_videos_available_batch(video_ids, youtube_client):
+    """
+    Check video availability in batches of 50 (API limit) 
+    Mark entire batch as unavailable on error
+    Returns dict mapping video_id -> availability (True/False)
+    """
+    results = {}
+    batch_size = 50
+    num_batches = min(int(len(video_ids) / batch_size), 10000) + 1
+    
+    for i in tqdm(range(0, len(video_ids), batch_size), total=num_batches, 
+                  desc="Checking video availability"):
+        batch = video_ids[i:i + batch_size]
+        
+        try:
+            request = youtube_client.videos().list(part="id", id=','.join(batch))
+            response = request.execute()
+            found_ids = {item['id'] for item in response.get('items', [])}
+            
+            for video_id in batch:
+                results[video_id] = video_id in found_ids
+                
+        except Exception as e:
+            for video_id in batch:
+                results[video_id] = False
+            
+    return results
 
 def add_zeroshot_features(df, batch_size=100):
     df['channel_display_name'] = df['channel_display_name'].fillna('')
@@ -159,12 +177,9 @@ def main(args, status_callback=None):
 
     # Add video availability column (True if available, False if blocked/unavailable)
     if 'video_id' in df.columns:
-        if status_callback:
-            desc = "Checking video availability"
-            status_callback(desc)
-        tqdm.pandas(desc=desc)
-        df['video_available'] = df['video_id'].progress_apply(
-            lambda vid: check_video_available(vid, io_rate_limit=args.io_rate_limit))
+        available_map = check_videos_available_batch(df['video_id'].tolist(), youtube)
+        tqdm.pandas(desc="Checking video availability")
+        df['video_available'] = df['video_id'].map(available_map)
     else:
         df['video_available'] = True  # Default to True if no video_id column
 
@@ -224,7 +239,6 @@ if __name__ == "__main__":
     parser.add_argument('--training-data', default='./data/export_all_claims_202505211438.csv', help='Training data CSV')
     parser.add_argument('--prediction-input', required=True, help='Input CSV for prediction')
     parser.add_argument('--prediction-output', default=f'export_all_claims_{datetime.now().strftime("%Y%m%d%H%M")}.csv', help='Output CSV')
-    parser.add_argument('--io-rate-limit',  type=float, default=1, help='Rate limit for I/O operations (seconds)')
     parser.add_argument('--skip-validation', action='store_true', help='Skip feg. cross-validation, etc.')
 
     args = parser.parse_args()
