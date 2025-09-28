@@ -5,15 +5,18 @@ import pandas as pd
 import argparse
 import os
 import time
+import requests 
+from urllib.parse import urljoin
 
 app = Flask(__name__)
-
+base_url = os.environ['BASE_URL']
 tasks = {}
 
 
 @app.route('/predict', methods=['POST'])
 def start_prediction():
 
+    # TODO: Omit humongous memory `.result` dict for every task!
     task_id = str(uuid.uuid4())
     tasks[task_id] = {
         'status': 'running',
@@ -34,9 +37,13 @@ def start_prediction():
 
     # Extract additional args  
     args = argparse.Namespace(
+        # args for pipeline.py
         prediction_input=csv_path,
         prediction_output=request.form.get('prediction_output', f"data/output_{task_id}.csv"),
-        skip_validation=request.form.get('skip_validation', 'false').lower() == 'true'
+        skip_validation=request.form.get('skip_validation', 'false').lower() == 'true',
+        # for server callback
+        webhook_url=request.form.get('webhook_url'),
+        pipeline_run_id=request.form.get('pipeline_run_id')  # ADD this
     )
 
     print(f"Received prediction request: {file.filename}", args)
@@ -101,11 +108,36 @@ def run_prediction(task_id, args):
         tasks[task_id]['status'] = 'completed'
         tasks[task_id]['result'] = result_df
         tasks[task_id]['csv_path'] = args.prediction_output
+
+        # Notify webhook of background task completion
+        if hasattr(args, 'webhook_url') and args.webhook_url:
+            notify_completion(args.webhook_url, task_id, args.pipeline_run_id)
         
     except Exception as e:
         print("Prediction error: ", e)
         tasks[task_id]['status'] = 'failed'
         tasks[task_id]['error'] = str(e)
+
+
+def notify_completion(webhook_url, task_id, pipeline_run_id):
+    print(f"Notifying the Webhook at: {webhook_url}" )
+
+    if webhook_url and task_id in tasks:
+        task = tasks[task_id]
+        if task['status'] == 'completed':
+
+             # csv_path hits CSV download route above
+            payload = {
+                'task_id': task_id,
+                'status': task['status'],
+                'error': task['error'],
+                'csv_path': urljoin(base_url.rstrip('/') + '/', f'download/{task_id}'), 
+                'pipeline_run_id': pipeline_run_id
+            }
+            try:
+                requests.post(webhook_url, json=payload)
+            except Exception as e:
+                print(f"Webhook notification failed: {e}")
 
 
 if __name__ == '__main__':
