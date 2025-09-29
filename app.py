@@ -139,7 +139,7 @@ def notify_completion(webhook_url, task_id, pipeline_run_id):
             try:
                 response = requests.post(webhook_url, json=payload, timeout=10)
                 response.raise_for_status() 
-                print(f"Webhook notification successful: {response.status_code}")
+                print(f"Webhook notification successful: {response.status_code} - {response.json()}")
             except requests.exceptions.RequestException as e:
                 print(f"Webhook notification failed: {e}")
 
