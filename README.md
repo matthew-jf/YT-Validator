@@ -58,7 +58,7 @@ curl -X POST http://localhost:3001/predict \
 Eg. response. Note the `task_id`
 
 ```json
-{"status":"started","task_id":"0669d93a-22e1-4f7b-942a-89ef8ff2d836"}
+{"status":"running","task_id":"0669d93a-22e1-4f7b-942a-89ef8ff2d836"}
 ```
 
 3. Get results using `task_id`

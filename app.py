@@ -52,7 +52,7 @@ def start_prediction():
     thread = threading.Thread(target=run_prediction, args=(task_id, args))
     thread.start()
     
-    return jsonify({'task_id': task_id, 'status': 'started'})
+    return jsonify({'task_id': task_id, 'status': 'running'})
 
 @app.route('/status/<task_id>')
 def get_status(task_id):
@@ -134,9 +134,13 @@ def notify_completion(webhook_url, task_id, pipeline_run_id):
                 'csv_path': urljoin(base_url.rstrip('/') + '/', f'download/{task_id}'), 
                 'pipeline_run_id': pipeline_run_id
             }
+
+            # Call webhook. Raise iff 4xx/5xx: webhook failure shouldn't break ML task
             try:
-                requests.post(webhook_url, json=payload)
-            except Exception as e:
+                response = requests.post(webhook_url, json=payload, timeout=10)
+                response.raise_for_status() 
+                print(f"Webhook notification successful: {response.status_code}")
+            except requests.exceptions.RequestException as e:
                 print(f"Webhook notification failed: {e}")
 
 
