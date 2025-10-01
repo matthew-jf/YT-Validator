@@ -131,7 +131,7 @@ def main(args, status_callback=None):
         df.to_csv('YT.csv', index=False)
 
     if status_callback:
-        status_callback("Training kNN model & cross-validating")
+        status_callback(f"Training kNN model & {'NOT' if args.skip_validation else ' '} cross-validating")
 
     # Train model
     df = pandas.read_csv('YT.csv')

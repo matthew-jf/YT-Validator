@@ -111,7 +111,7 @@ def run_prediction(task_id, args):
 
         # Notify webhook of background task completion
         if hasattr(args, 'webhook_url') and args.webhook_url:
-            notify_completion(args.webhook_url, task_id, args.pipeline_run_id)
+            notify_completion(args.webhook_url, task_id, args.pipeline_run_id, len(result_df))
         
     except Exception as e:
         print("Prediction error: ", e)
@@ -119,7 +119,7 @@ def run_prediction(task_id, args):
         tasks[task_id]['error'] = str(e)
 
 
-def notify_completion(webhook_url, task_id, pipeline_run_id):
+def notify_completion(webhook_url, task_id, pipeline_run_id, num_results):
     print(f"Notifying the Webhook at: {webhook_url}" )
 
     if webhook_url and task_id in tasks:
@@ -132,6 +132,7 @@ def notify_completion(webhook_url, task_id, pipeline_run_id):
                 'status': task['status'],
                 'error': task['error'],
                 'csv_path': urljoin(base_url.rstrip('/') + '/', f'download/{task_id}'), 
+                'num_results': num_results,
                 'pipeline_run_id': pipeline_run_id
             }
 
