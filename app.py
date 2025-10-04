@@ -13,6 +13,15 @@ base_url = os.environ['BASE_URL']
 tasks = {}
 
 
+@app.route('/health')
+def health_check():
+    return jsonify({
+        'status': 'healthy',
+        'service': 'YT-Validator',
+        'version': '1.0.0',
+        'timestamp': time.time()
+    })
+
 @app.route('/predict', methods=['POST'])
 def start_prediction():
 
