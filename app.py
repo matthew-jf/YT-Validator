@@ -25,10 +25,11 @@ def health_check():
 @app.route('/predict', methods=['POST'])
 def start_prediction():
 
-    # TODO: Omit humongous memory `.result` dict for every task!
+    # TODO: Omit unnecessary humongous memory `.result` dict for every task!
     task_id = str(uuid.uuid4())
     tasks[task_id] = {
         'status': 'running',
+        'message': None,          # Status messages from callbacks
         'result': None,
         'error': None,
         'csv_path': None
@@ -94,21 +95,39 @@ def download_csv(task_id):
     
     return send_file(task['csv_path'], as_attachment=True)
 
+@app.route('/stop/<task_id>', methods=['POST'])
+def stop_task(task_id):
+    if task_id not in tasks:
+        return jsonify({'error': 'Task not found'}), 404
+    
+    task = tasks[task_id]
+    if task['status'] not in ['running']:
+        return jsonify({'error': f'Task already {task["status"]}'}), 400
+    
+    tasks[task_id]['stopped'] = True
+    return jsonify({'status': 'stopping', 'task_id': task_id})
 
 def run_prediction(task_id, args):
 
     start_time = time.time()
 
-    def update_status(status):              
+    def update_status(message):              
         elapsed = int(time.time() - start_time)
         current_time = time.strftime("%H:%M:%S")
-        print(f"[{current_time}] {status} (elapsed: {elapsed}s)")
-        tasks[task_id]['status'] = status
+        print(f"[{current_time}] {message} (elapsed: {elapsed}s)")
+        tasks[task_id]['message'] = message
+
+    def should_stop():
+        return tasks[task_id].get('stopped', False)
 
     try:
         
         from pipeline import main
-        main(args, status_callback=update_status)
+        main(args, status_callback=update_status, stop_check=should_stop)
+
+        if should_stop():
+            tasks[task_id]['status'] = 'stopped'
+            return
         
         # Load the CSV that was saved
         print(f"Loading results from {args.prediction_output}")

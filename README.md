@@ -45,6 +45,32 @@ eg. `--training-data /Users/matthew.jurewicz/Downloads/export_all_claims_2025072
 python app.py
 ```
 
+Optional `.vscode/launch.json`:
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Flask (Conda Debug)",
+      "type": "python",
+      "request": "launch",
+      "module": "flask",
+      "env": {
+        "FLASK_APP": "app.py",
+        "FLASK_ENV": "development",
+        "FLASK_RUN_PORT": "3001",
+        "FLASK_RUN_HOST": "0.0.0.0",
+        "YT_API_KEY": "AIza...",
+        "BASE_URL": "http://localhost:3001"
+      },
+      "args": [
+        "run"
+      ]
+    }
+  ]
+}
+```
+
 2. Start the pipeline
 
 ```shell
@@ -55,21 +81,28 @@ curl -X POST http://localhost:3001/predict \
   -F "skip_validation=true" 
 ```
 
-Eg. response. Note the `task_id`
+Only required arg is input file.
+Eg. response: note the running `task_id` returned
 
 ```json
 {"status":"running","task_id":"0669d93a-22e1-4f7b-942a-89ef8ff2d836"}
 ```
 
-3. Get results using `task_id`
+3. Get status or results
+
+Follow up with `task_id` from previous step:
 
 ```shell
 # Check status  
-curl http://localhost:5000/status/TASK_ID
+curl http://localhost:3001/status/TASK_ID
 
 # Get JSON results
-curl http://localhost:5000/results/TASK_ID
+curl http://localhost:3001/results/TASK_ID
 
 # Download CSV
-curl http://localhost:5000/download/TASK_ID -o results.csv
+curl http://localhost:3001/download/TASK_ID -o results.csv
+
+# Stop task
+curl -X POST http://localhost:3001/stop/TASK_ID
+
 ```

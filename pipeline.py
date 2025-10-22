@@ -39,7 +39,7 @@ claim_kind = ['VIDEO_MATCHAUDIOVISUAL', 'VIDEO_MATCHVISUAL', 'AUDIO_MATCHAUDIO',
 content_type = ['UGC', 'SONG_UGC', 'PARTNER_UPLOADED']
 
 # Function to check if YouTube videos are available
-def check_videos_available_batch(video_ids, youtube_client):
+def check_videos_available_batch(video_ids, youtube_client, check_stopped=None):
     """
     Check video availability in batches of 50 (API limit) 
     Mark entire batch as unavailable on error
@@ -48,9 +48,10 @@ def check_videos_available_batch(video_ids, youtube_client):
     results = {}
     batch_size = 50
     num_batches = min(int(len(video_ids) / batch_size), 10000) + 1
+    msg = "Checking video availability"
     
-    for i in tqdm(range(0, len(video_ids), batch_size), total=num_batches, 
-                  desc="Checking video availability"):
+    for i in tqdm(range(0, len(video_ids), batch_size), total=num_batches, desc=msg):
+        if check_stopped: check_stopped(msg)
         batch = video_ids[i:i + batch_size]
         
         try:
@@ -67,19 +68,22 @@ def check_videos_available_batch(video_ids, youtube_client):
             
     return results
 
-def add_zeroshot_features(df, batch_size=100):
+def add_zeroshot_features(df, batch_size=100, check_stopped=None):
     df['channel_display_name'] = df['channel_display_name'].fillna('')
     df['video_title'] = df['video_title'].fillna('')
     texts = (df['channel_display_name'] + ' ' + df['video_title']).tolist()
+    msg = "Zero-shot classification"
     
     # Initialize columns
     for code in codes:
         df[f'zeroshot_score_{code}'] = 0.0
     
     # Process in batches with progress bar
-    for i in tqdm(range(0, len(texts), batch_size), desc="Zero-shot classification"):
+    for i in tqdm(range(0, len(texts), batch_size), desc=msg):
+        if check_stopped: check_stopped(msg)
         batch_texts = texts[i:i+batch_size]
         results = classifier(batch_texts, candidate_labels, multi_label=False)
+        
         
         for j, result in enumerate(results):
             score_dict = dict(zip(result['labels'], result['scores']))
@@ -89,13 +93,20 @@ def add_zeroshot_features(df, batch_size=100):
     return df
 
 
-def main(args, status_callback=None):
+def main(args, status_callback=None, stop_check=None):
+
+    def check_stopped(stage=""):
+        if stop_check and stop_check():
+            message = f"Task stopped during {stage if stage else 'by user'}"
+            raise TaskStoppedError(message)
 
     # Load training data and create YT.csv if it doesn't exist
     if not os.path.exists('YT.csv'):
         
+        msg = "Loading training data"
+        check_stopped(msg)
         if status_callback:
-            status_callback("Loading training data")
+            status_callback(msg)
     
         df = pandas.read_csv(args.training_data,
             dtype=dict(views='Int32', matching_duration='Int32', longest_match='Int32', video_duration_sec='Int32'))
@@ -103,7 +114,7 @@ def main(args, status_callback=None):
         df.verdict = np.array(df.verdict == 'Y', dtype=int)
 
         # Add zero-shot features to training data
-        df = add_zeroshot_features(df)
+        df = add_zeroshot_features(df, check_stopped=check_stopped)
 
         # Create claim feature and select columns
         df['claim'] = df.claim_origin + df.claim_type
@@ -130,6 +141,7 @@ def main(args, status_callback=None):
         df = df.fillna(0)
         df.to_csv('YT.csv', index=False)
 
+    check_stopped("before model training")
     if status_callback:
         status_callback(f"Training kNN model & {'NOT' if args.skip_validation else ' '} cross-validating")
 
@@ -177,14 +189,16 @@ def main(args, status_callback=None):
 
     # Add video availability column (True if available, False if blocked/unavailable)
     if 'video_id' in df.columns:
-        available_map = check_videos_available_batch(df['video_id'].tolist(), youtube)
-        tqdm.pandas(desc="Checking video availability")
+        msg = "Checking video availability"
+        check_stopped(msg)
+        available_map = check_videos_available_batch(df['video_id'].tolist(), youtube, check_stopped=check_stopped)
+        tqdm.pandas(desc=msg)
         df['video_available'] = df['video_id'].map(available_map)
     else:
         df['video_available'] = True  # Default to True if no video_id column
 
     # Add zero-shot features to unprocessed data
-    df2 = add_zeroshot_features(df2)
+    df2 = add_zeroshot_features(df2, check_stopped=check_stopped)
 
     # Prepare features
     df2['claim'] = df2.claim_origin + df2.claim_type
@@ -209,6 +223,7 @@ def main(args, status_callback=None):
 
     df2 = df2.fillna(0)
 
+    check_stopped("before predictions")
     if status_callback:
         status_callback("Making predictions")
 
@@ -232,13 +247,17 @@ def main(args, status_callback=None):
     df.to_csv(args.prediction_output, index=False)
 
 
+class TaskStoppedError(Exception):
+    pass
+
+
 if __name__ == "__main__":
 
     # Setup argument parser
     parser = argparse.ArgumentParser(description='Process claims data and train classifier')
     parser.add_argument('--training-data', default='./data/export_all_claims_202505211438.csv', help='Training data CSV')
     parser.add_argument('--prediction-input', required=True, help='Input CSV for prediction')
-    parser.add_argument('--prediction-output', default=f'export_all_claims_{datetime.now().strftime("%Y%m%d%H%M")}.csv', help='Output CSV')
+    parser.add_argument('--prediction-output', default=f'ml_enriched_claims_{datetime.now().strftime("%Y%m%d%H%M")}.csv', help='Output CSV')
     parser.add_argument('--skip-validation', action='store_true', help='Skip feg. cross-validation, etc.')
 
     args = parser.parse_args()
