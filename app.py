@@ -9,7 +9,6 @@ import requests
 from urllib.parse import urljoin
 
 app = Flask(__name__)
-base_url = os.environ['BASE_URL']
 tasks = {}
 
 
@@ -159,7 +158,7 @@ def notify_completion(webhook_url, task_id, pipeline_run_id, num_results):
                 'task_id': task_id,
                 'status': task['status'],
                 'error': task['error'],
-                'csv_path': urljoin(base_url.rstrip('/') + '/', f'download/{task_id}'), 
+                'csv_path': f"/download/{task_id}", 
                 'num_results': num_results,
                 'pipeline_run_id': pipeline_run_id
             }
@@ -176,6 +175,6 @@ def notify_completion(webhook_url, task_id, pipeline_run_id, num_results):
 if __name__ == '__main__':
     
     host = os.getenv("FLASK_RUN_HOST", "0.0.0.0")
-    port = int(os.getenv("FLASK_RUN_PORT", 3001))
-    debug = os.getenv("FLASK_DEBUG", "1") == "1"
+    port = int(os.getenv("PORT", os.getenv("FLASK_RUN_PORT", "3001")))  # So PORT env also works
+    debug = os.getenv("FLASK_DEBUG", "0") == "1"
     app.run(host=host, port=port, debug=debug)
