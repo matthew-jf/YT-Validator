@@ -50,6 +50,7 @@ def start_prediction():
         prediction_input=csv_path,
         prediction_output=request.form.get('prediction_output', f"data/output_{task_id}.csv"),
         skip_validation=request.form.get('skip_validation', 'false').lower() == 'true',
+        training_data=request.form.get('training_data'),  # Optional path to training data CSV
         # for server callback
         webhook_url=request.form.get('webhook_url'),
         pipeline_run_id=request.form.get('pipeline_run_id')  # ADD this

@@ -102,6 +102,8 @@ def main(args, status_callback=None, stop_check=None):
 
     # Load training data and create YT.csv if it doesn't exist
     if not os.path.exists('YT.csv'):
+        if not args.training_data:
+            raise ValueError("Training data is required to re-create YT.csv")
         
         msg = "Loading training data"
         check_stopped(msg)
@@ -248,6 +250,7 @@ def main(args, status_callback=None, stop_check=None):
 
 
 class TaskStoppedError(Exception):
+    """Custom exception to indicate task was stopped."""
     pass
 
 

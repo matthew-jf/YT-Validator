@@ -20,7 +20,6 @@ Export required envs:
 
 ```shell
 YT_API_KEY=AIza...              # Grab free from GCP console - 1 unit per 50 videos capped at 10k units/day.
-BASE_URL=http://localhost:3001  # Our URL, ie. YT-Validator API server
 ```
 
 ## CLI 
@@ -62,7 +61,6 @@ Optional `.vscode/launch.json`:
         "FLASK_RUN_PORT": "3001",
         "FLASK_RUN_HOST": "0.0.0.0",
         "YT_API_KEY": "AIza...",
-        "BASE_URL": "http://localhost:3001"
       },
       "args": [
         "run"
