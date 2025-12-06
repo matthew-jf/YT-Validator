@@ -186,8 +186,8 @@ def main(args, status_callback=None, stop_check=None):
     # Add licensed boolean column
     df['licensed'] = df['asset_id'].isin(licensed_asset_ids)
 
-    # Add media_component_id column
-    df['media_component_id'] = df['asset_id'].map(asset_to_media_component)
+    # Add mapped media_component_id as new column
+    df['asset_mapped_media_component_id'] = df['asset_id'].map(asset_to_media_component)
 
     # Add video availability column (True if available, False if blocked/unavailable)
     if 'video_id' in df.columns:
