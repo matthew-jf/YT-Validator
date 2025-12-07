@@ -20,9 +20,14 @@ youtube = build('youtube', 'v3', developerKey=os.environ["YT_API_KEY"])
 # Suppress warnings
 warnings.filterwarnings('ignore')
 
-# Initialize zero-shot classifier
-classifier = pipeline("zero-shot-classification", 
-                     model="MoritzLaurer/multilingual-MiniLMv2-L6-mnli-xnli")
+# Initialize zero-shot classifier with caching
+cache_dir = os.path.join(os.path.dirname(__file__), '.cache', 'transformers')
+os.makedirs(cache_dir, exist_ok=True)
+classifier = pipeline(
+    "zero-shot-classification", 
+    model="MoritzLaurer/multilingual-MiniLMv2-L6-mnli-xnli",
+    model_kwargs={"cache_dir": cache_dir}
+)
 
 # Load category descriptions
 categories_df = pandas.read_csv('no_codes - Sheet1.csv')
