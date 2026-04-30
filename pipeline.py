@@ -1,9 +1,10 @@
 import pandas
 import numpy as np
-from sklearn import (
-    neighbors,
-    base
-)
+from sklearn import base
+from sklearn.linear_model import SGDClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.metrics import balanced_accuracy_score
 import copy
 from transformers import pipeline
 from tqdm import tqdm
@@ -106,7 +107,10 @@ if not os.path.exists('YT.csv'):
 # Train model
 df = pandas.read_csv('YT.csv')
 df, y = df.drop(columns='verdict'), df.verdict
-soln = neighbors.KNeighborsClassifier(n_neighbors=11, p=1)
+soln = make_pipeline(
+    StandardScaler(),
+    SGDClassifier(loss='log_loss', class_weight='balanced', random_state=0)
+)
 for _ in range(4):
     test = np.random.permutation(len(df))
     test = test[:len(df) // 4]
@@ -114,8 +118,8 @@ for _ in range(4):
 
     soln.fit(df[~test], y[~test])
     valid = soln.predict_proba(df[test])
-    valid = valid[:,1]
-    print(sum((valid > 1/2) == y[test]) / sum(test))
+    valid = valid[:, 1]
+    print(balanced_accuracy_score(y[test], valid > 1/2))
     soln = base.clone(soln)
 soln.fit(df, y)
 
@@ -173,7 +177,7 @@ df2 = df2.fillna(0)
 
 # Make predictions
 valid = soln.predict_proba(df2)
-valid = valid[:,1]
+valid = valid[:, 1]
 df['rating'] = valid
 
 # Set rating to 0 for unavailable videos
