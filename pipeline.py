@@ -73,6 +73,7 @@ if not os.path.exists('YT.csv'):
     df = pandas.read_csv(r"/Users/matthew.jurewicz/Downloads/export_all_claims_202507241336.csv",
         dtype=dict(views='Int32', matching_duration='Int32', longest_match='Int32', video_duration_sec='Int32'))
     df = df[df.verdict != 'U']
+    df = df[~df.no_code.isin(excluded_codes)]
     df.verdict = np.array(df.verdict == 'Y', dtype=int)
 
     # Add zero-shot features to training data
