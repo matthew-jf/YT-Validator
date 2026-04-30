@@ -48,24 +48,23 @@ def check_video_available(video_id):
         return False
 
 def add_zeroshot_features(df, batch_size=100):
+    df = df.reset_index(drop=True)
     df['channel_display_name'] = df['channel_display_name'].fillna('')
     df['video_title'] = df['video_title'].fillna('')
     texts = (df['channel_display_name'] + ' ' + df['video_title']).tolist()
-    
-    # Initialize columns
-    for code in codes:
-        df[f'zeroshot_score_{code}'] = 0.0
-    
-    # Process in batches with progress bar
+
+    scores = {code: np.zeros(len(texts), dtype=float) for code in codes}
+
     for i in tqdm(range(0, len(texts), batch_size), desc="Zero-shot classification"):
         batch_texts = texts[i:i+batch_size]
         results = classifier(batch_texts, candidate_labels, multi_label=False)
-        
         for j, result in enumerate(results):
             score_dict = dict(zip(result['labels'], result['scores']))
             for code, desc in zip(codes, candidate_labels):
-                df.loc[i+j, f'zeroshot_score_{code}'] = score_dict[desc]
-    
+                scores[code][i+j] = score_dict[desc]
+
+    for code in codes:
+        df[f'zeroshot_score_{code}'] = scores[code]
     return df
 
 # Load training data and create YT.csv if it doesn't exist
