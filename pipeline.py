@@ -196,6 +196,15 @@ if not os.path.exists('YT.csv'):
     df = df[~df.no_code.isin(excluded_codes)]
     df.verdict = np.array(df.verdict == 'Y', dtype=int)
 
+    # Balanced sample: 100K per verdict class (200K total) to limit zero-shot
+    # API calls / cost while ensuring class balance. If a class has fewer than
+    # PER_CLASS_N rows, take all of them.
+    PER_CLASS_N = 100000
+    df = pandas.concat(
+        [g.sample(n=min(PER_CLASS_N, len(g)), random_state=0)
+         for _, g in df.groupby('verdict')]
+    ).reset_index(drop=True)
+
     # Add zero-shot features to training data
     df = add_zeroshot_features(df)
 
