@@ -1,4 +1,9 @@
-*.csv
 .DS_Store
+.cache/
+.vscode/
 __pycache__/
-.vscode/launch.json
+data/
+*.csv
+!Licensed.csv
+!assets_single_media_component.csv
+!no_codes - Sheet1.csv
