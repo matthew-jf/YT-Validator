@@ -1,10 +1,8 @@
 import pandas
 import numpy as np
 from sklearn import base
-from sklearn.linear_model import SGDClassifier
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import make_pipeline
 from sklearn.metrics import balanced_accuracy_score
+from xgboost import XGBClassifier
 import copy
 import json
 import os
@@ -238,9 +236,24 @@ if not os.path.exists('YT.csv'):
 # ---------------------------------------------------------------------------
 df = pandas.read_csv('YT.csv')
 df, y = df.drop(columns='verdict'), df.verdict
-soln = make_pipeline(
-    StandardScaler(),
-    SGDClassifier(loss='log_loss', class_weight='balanced', random_state=0)
+
+# Handle class imbalance the XGBoost-native way. With the 100K/100K balanced
+# sample this is ~1.0; kept explicit so it stays correct if a class is smaller
+# than PER_CLASS_N.
+neg, pos = (y == 0).sum(), (y == 1).sum()
+scale_pos_weight = (neg / pos) if pos > 0 else 1.0
+
+soln = XGBClassifier(
+    n_estimators=500,
+    max_depth=6,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    tree_method='hist',
+    eval_metric='logloss',
+    scale_pos_weight=scale_pos_weight,
+    n_jobs=-1,
+    random_state=0,
 )
 for _ in range(4):
     test = np.random.permutation(len(df))
