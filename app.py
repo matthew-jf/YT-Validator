@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 from flask import Flask, request, jsonify, send_file
 import threading
 import uuid
@@ -6,7 +9,9 @@ import argparse
 import os
 import time
 import requests 
-from urllib.parse import urljoin
+
+from helpers import GIT_BRANCH, GIT_COMMIT
+
 
 app = Flask(__name__)
 tasks = {}
@@ -18,6 +23,8 @@ def health_check():
         'status': 'healthy',
         'service': 'YT-Validator',
         'version': '1.0.0',
+        'branch': GIT_BRANCH,
+        'commit': GIT_COMMIT,
         'timestamp': time.time()
     })
 

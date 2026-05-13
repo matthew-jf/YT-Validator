@@ -16,10 +16,12 @@ Uncompress training data:
 7z x YT.csv.7z
 ```
 
-Export required envs:
+Configure secrets via `.env` `cp .env.example .env` and edit .env with your keys
+Or export required envs:
 
 ```shell
-YT_API_KEY=AIza...              # Grab free from GCP console - 1 unit per 50 videos capped at 10k units/day.
+YT_API_KEY=AIza...                # Grab free from GCP console - 1 unit per 50 videos capped at 10k units/day.
+OPENAI_API_KEY=sk-proj-...
 ```
 
 ## CLI 
@@ -44,7 +46,7 @@ eg. `--training-data /Users/matthew.jurewicz/Downloads/export_all_claims_2025072
 python app.py
 ```
 
-Optional `.vscode/launch.json`:
+2. Optional debug config `.vscode/launch.json`. Envs are optional if using `.env` file.
 ```json
 {
   "version": "0.2.0",
@@ -70,7 +72,7 @@ Optional `.vscode/launch.json`:
 }
 ```
 
-2. Start the pipeline
+3. Start the pipeline
 
 ```shell
 curl -X POST http://localhost:3001/predict \
@@ -87,7 +89,7 @@ Eg. response: note the running `task_id` returned
 {"status":"running","task_id":"0669d93a-22e1-4f7b-942a-89ef8ff2d836"}
 ```
 
-3. Get status or results
+4. Get status or results
 
 Follow up with `task_id` from previous step:
 

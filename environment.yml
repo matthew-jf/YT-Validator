@@ -1,7 +1,9 @@
+# conda env update -f environment.yml --prune
 name: YT-Validator
 channels:
   - https://repo.anaconda.com/pkgs/main
   - https://repo.anaconda.com/pkgs/r
+  - conda-forge
 dependencies:
   - python=3.11
   - scikit-learn
@@ -11,4 +13,5 @@ dependencies:
   - numpy
   - openai
   - tqdm
-prefix: /opt/anaconda3/envs/YT-Validator
+  - python-dotenv
+  - flask
