@@ -1,5 +1,5 @@
 # Keep env loading first, Gunicorn/Flask import app.py as a module
-from helpers import load_env, GIT_BRANCH, GIT_COMMIT
+from helpers import load_env
 load_env(["YT_API_KEY", "OPENAI_API_KEY"])
 
 
@@ -12,10 +12,12 @@ import os
 import time
 import requests 
 
+from helpers import TaskStore, get_git_info
 
     
 app = Flask(__name__)
-tasks = {}
+tasks = TaskStore()
+GIT_BRANCH, GIT_COMMIT = get_git_info()
 
 
 @app.route('/health')
@@ -29,22 +31,19 @@ def health_check():
         'timestamp': time.time()
     })
 
+
 @app.route('/predict', methods=['POST'])
 def start_prediction():
 
-    # TODO: Omit unnecessary humongous memory `.result` dict for every task!
+    # Status messages from callbacks will be in `message`, and final CSV path in `csv_path`
     task_id = str(uuid.uuid4())
-    tasks[task_id] = {
-        'status': 'running',
-        'message': None,          # Status messages from callbacks
-        'result': None,
-        'error': None,
-        'csv_path': None
-    }
+    tasks[task_id] = { 'status': 'running', 'message': None, 'error': None, 'csv_path': None }
+    tasks.save()
 
     if 'file' not in request.files:
         tasks[task_id]['status'] = 'failed'
         tasks[task_id]['error'] = 'No file part in request'
+        tasks.save()
         return jsonify(tasks[task_id]), 400
 
     # Save received file
@@ -72,6 +71,7 @@ def start_prediction():
     
     return jsonify({'task_id': task_id, 'status': 'running'})
 
+
 @app.route('/status/<task_id>')
 def get_status(task_id):
     if task_id not in tasks:
@@ -80,6 +80,7 @@ def get_status(task_id):
         'status': tasks[task_id]['status'],
         'error': tasks[task_id]['error']
     })
+
 
 @app.route('/results/<task_id>')
 def get_results(task_id):
@@ -90,7 +91,11 @@ def get_results(task_id):
     if task['status'] != 'completed':
         return jsonify({'error': 'Task not completed'}), 400
     
-    return jsonify(task['result'].to_dict('records'))
+    if not task.get('csv_path'):
+        return jsonify({'error': 'No results available'}), 400
+    
+    return jsonify(pd.read_csv(task['csv_path']).to_dict('records'))
+
 
 @app.route('/download/<task_id>')
 def download_csv(task_id):
@@ -103,6 +108,7 @@ def download_csv(task_id):
     
     return send_file(task['csv_path'], as_attachment=True)
 
+
 @app.route('/stop/<task_id>', methods=['POST'])
 def stop_task(task_id):
     if task_id not in tasks:
@@ -113,7 +119,10 @@ def stop_task(task_id):
         return jsonify({'error': f'Task already {task["status"]}'}), 400
     
     tasks[task_id]['stopped'] = True
+    tasks.save()
     return jsonify({'status': 'stopping', 'task_id': task_id})
+
+
 
 def run_prediction(task_id, args):
 
@@ -135,15 +144,16 @@ def run_prediction(task_id, args):
 
         if should_stop():
             tasks[task_id]['status'] = 'stopped'
+            tasks.save()
             return
         
-        # Load the CSV that was saved
-        print(f"Loading results from {args.prediction_output}")
+        # Task completed. Load the CSV that was saved
         result_df = pd.read_csv(args.prediction_output)
-        
+        update_status(f"Completed ({len(result_df)} rows) → {args.prediction_output}")
+
         tasks[task_id]['status'] = 'completed'
-        tasks[task_id]['result'] = result_df
         tasks[task_id]['csv_path'] = args.prediction_output
+        tasks.save()
 
         # Notify webhook of background task completion
         if hasattr(args, 'webhook_url') and args.webhook_url:
@@ -153,7 +163,8 @@ def run_prediction(task_id, args):
         print("Prediction error: ", e)
         tasks[task_id]['status'] = 'failed'
         tasks[task_id]['error'] = str(e)
-
+        tasks.save()
+        
 
 def notify_completion(webhook_url, task_id, pipeline_run_id, num_results):
     print(f"Notifying the Webhook at: {webhook_url}" )
