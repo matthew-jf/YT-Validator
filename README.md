@@ -1,3 +1,4 @@
+````markdown
 # YT-Validator
 
 
@@ -8,6 +9,13 @@ Create conda env with expected Python / dependencies versions:
 ```shell
 conda env create -f environment.yml
 conda activate YT-Validator
+```
+
+On servers where systemd runs the service as `root`, update the env as root so changes land in the right place:
+
+```shell
+sudo /opt/miniconda3/bin/conda env update -n YT-Validator -f /opt/yt-validator/environment.yml --prune
+sudo systemctl restart yt-validator
 ```
 
 Uncompress training data:
@@ -46,30 +54,16 @@ eg. `--training-data /Users/matthew.jurewicz/Downloads/export_all_claims_2025072
 python app.py
 ```
 
-2. Optional debug config `.vscode/launch.json`. Envs are optional if using `.env` file.
+2. Verify it's up:
+
+```shell
+curl http://localhost:3001/health
+```
+
+Response includes git branch/commit for deploy verification:
+
 ```json
-{
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "name": "Flask (Conda Debug)",
-      "type": "python",
-      "request": "launch",
-      "module": "flask",
-      "env": {
-        "FLASK_APP": "app.py",
-        "FLASK_ENV": "development",
-        "FLASK_DEBUG":  "1",
-        "FLASK_RUN_PORT": "3001",
-        "FLASK_RUN_HOST": "0.0.0.0",
-        "YT_API_KEY": "AIza...",
-      },
-      "args": [
-        "run"
-      ]
-    }
-  ]
-}
+{"branch":"chore/cli-api-wrapper","commit":"be0faa3","service":"YT-Validator","status":"healthy","timestamp":1778717209.804979,"version":"1.0.0"}
 ```
 
 3. Start the pipeline
@@ -108,55 +102,49 @@ curl -X POST http://localhost:3001/stop/TASK_ID
 
 ```
 
-## Build and deploy to Google Cloud Run
+## Debug config (optional)
 
-1. Build
+`.vscode/launch.json` — envs optional if using `.env`:
 
-```shell
-conda env export --name YT-Validator --no-builds > environment-no-builds.yml
-docker buildx build --platform linux/amd64 -t yt-validator:latest .
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Flask (Conda Debug)",
+      "type": "python",
+      "request": "launch",
+      "module": "flask",
+      "env": {
+        "FLASK_APP": "app.py",
+        "FLASK_ENV": "development",
+        "FLASK_DEBUG":  "1",
+        "FLASK_RUN_PORT": "3001",
+        "FLASK_RUN_HOST": "0.0.0.0"
+      },
+      "args": ["run"]
+    }
+  ]
+}
 ```
 
-2. Env setup
+## Deploy (systemd)
+
+On servers where systemd runs the service as `root`, update the env as root so changes land in the right place:
 
 ```shell
-export \
-  PROJECT_ID=... \
-  SERVICE_ACCOUNT=...
-
-export \
-  YT_API_KEY=AIza... 
-
-# Create secret on GCP for YT API key (requires project admin)
-echo -n $YT_API_KEY | gcloud secrets create youtube-api-key --data-file=-
+sudo /opt/miniconda3/bin/conda env update -n YT-Validator -f /opt/yt-validator/environment.yml --prune
+sudo systemctl restart yt-validator
 ```
 
-3. Push to Artifact Registry
+Tail logs:
 
 ```shell
-docker tag yt-validator:latest us-east1-docker.pkg.dev/$PROJECT_ID/ytdt-claims/yt-validator:latest
-docker push us-east1-docker.pkg.dev/$PROJECT_ID/ytdt-claims/yt-validator:latest
-  ```
+sudo journalctl -u yt-validator -f
+```
 
-4. Deploy to Cloud Run
-
-```shell
-gcloud run deploy yt-validator \
-  --image us-east1-docker.pkg.dev/$PROJECT_ID/ytdt-claims/yt-validator:latest \
-  --platform managed \
-  --region us-east1 \
-  --memory 4Gi \
-  --cpu 2 \
-  --timeout 3600 \
-  --service-account $SERVICE_ACCOUNT \
-  --set-secrets YT_API_KEY=youtube-api-key:latest \
-  --allow-unauthenticated
-  ```
-
-### Post-deployment
-
-* Retrieve actual webservice URL
+Verify deployment via health check — response includes git branch/commit:
 
 ```shell
-gcloud run services describe yt-validator --region us-east1 --format 'value(status.url)'
+curl http://localhost:3001/health
 ```
