@@ -1,5 +1,7 @@
-from dotenv import load_dotenv
-load_dotenv()
+# Keep env loading first, Gunicorn/Flask import app.py as a module
+from helpers import load_env, GIT_BRANCH, GIT_COMMIT
+load_env(["YT_API_KEY", "OPENAI_API_KEY"])
+
 
 from flask import Flask, request, jsonify, send_file
 import threading
@@ -10,9 +12,8 @@ import os
 import time
 import requests 
 
-from helpers import GIT_BRANCH, GIT_COMMIT
 
-
+    
 app = Flask(__name__)
 tasks = {}
 

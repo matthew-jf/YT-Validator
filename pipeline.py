@@ -15,9 +15,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from openai import OpenAI
 from googleapiclient.discovery import build
-from dotenv import load_dotenv
+from helpers import load_env
 
-load_dotenv()
+load_env(["YT_API_KEY", "OPENAI_API_KEY"])
 
 # For checking YouTube video availability
 youtube = build('youtube', 'v3', developerKey=os.environ["YT_API_KEY"])
