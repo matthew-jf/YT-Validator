@@ -26,13 +26,12 @@ The project is broken down into distinct, logical components to separate feature
 To balance speed, interpretability, and predictive power, this system utilizes a two-tier "Baseline vs. Challenger" architecture.
 
 ### 1. The Baseline: XGBoost (`xgb_baseline.json`)
-* **Role:** Primary decision engine. 
-* **Design:** A lightweight gradient boosting classifier trained on a subset of mathematical and structural features (duration diffs, fuzzy text ratios). It is explicitly weighted to be overly harsh on False Negatives to protect against financial/legal risk.
+* **Role:** Baseline model for initial testing. 
+* **Design:** A lightweight gradient boosting classifier trained on a subset of mathematical and structural features (duration diffs, fuzzy text ratios). It is explicitly weighted to be overly harsh on False Negatives to protect against bad predictions.
 
 ### 2. The Challenger: AutoGluon (`ag_challenger/`)
-* **Role:** Secondary ensemble stack.
+* **Role:** Secondary ensemble stack. Primary decision maker.
 * **Design:** AutoGluon automatically trains and ensembles multiple model types (LightGBM, CatBoost, Random Forests, etc.). 
-* **Crucial Optimization Note:** `dynamic_stacking` has been explicitly set to `False`. While AutoGluon is incredibly powerful, multi-layer dynamic stacking is notoriously memory-intensive and frequently causes local compute environments to crash during long runs. Disabling it ensures the training script can execute reliably on a standard machine while still capturing the benefits of base-level ensembling.
 
 ---
 
@@ -44,3 +43,11 @@ Everything is containerized via PEP 723 inline dependencies and the `uv` package
 Ensure the bash script is executable:
 ```bash
 chmod +x pipeline.sh
+```
+or open a bash terminal and run:
+```bash
+cd trey_pipeline
+
+
+./pipeline.sh
+```
