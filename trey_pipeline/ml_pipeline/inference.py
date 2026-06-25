@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 def run_inference(
     data_path=PROJECT_ROOT / "data" / "may_claims.csv",
     model_dir=PROJECT_ROOT / "models",
-    output_path=PROJECT_ROOT / "data" / "clean_all_claims.csv",
+    output_path=PROJECT_ROOT / "data" / "output_claims.csv",
 ):
     print(f"Loading data from {data_path}...")
     df = pd.read_csv(data_path, engine='python', on_bad_lines='skip', encoding='utf-8-sig')

@@ -12,7 +12,7 @@ from sklearn.metrics import accuracy_score, confusion_matrix
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 def evaluate_and_visualize(
-    data_path=PROJECT_ROOT / "data" / "clean_all_claims.csv",
+    data_path=PROJECT_ROOT / "data" / "output_claims.csv",
     output_path=PROJECT_ROOT / "data" / "workload_reduction.png",
 ):
     df = pd.read_csv(data_path)
