@@ -20,6 +20,10 @@ fi
 echo "Executing Inference..."
 uv run --python 3.11 ml_pipeline/inference.py
 
-# 3. Validation / Visualization
+# 3. Mapper enrichment for Auto Yes claims
+echo "Generating MCID mapper guesses for Auto Yes claims..."
+uv run --python 3.11 mcid_mapper/mcid_mapper.py
+
+# 4. Validation / Visualization
 echo "Generating Performance Scorecards..."
 uv run --python 3.11 ml_pipeline/visualize.py
