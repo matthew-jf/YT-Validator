@@ -10,6 +10,7 @@ import time
 import re
 import math
 import subprocess
+import html
 from pathlib import Path
 
 import pandas as pd
@@ -151,7 +152,42 @@ def detect_language_from_title(title):
 
 
 # ==========================================
-# 3. WHISPER LANGUAGE CHECKER CORE
+# 3. GOOGLE TRANSLATE API HELPER
+# ==========================================
+def translate_text(text, target_lang="en"):
+    """
+    Translates text using the official Google Cloud Translation API v2 endpoint.
+    Requires GOOGLE_API_KEY to be set in your environment/.env file.
+    """
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        return "[Translation Error: GOOGLE_API_KEY missing from environment]", ""
+    if not text or not text.strip():
+        return "", ""
+
+    try:
+        url = "https://translation.googleapis.com/language/translate/v2"
+        response = requests.post(
+            url,
+            params={"key": api_key},
+            json={"q": [text], "target": target_lang},
+            timeout=10
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        translation_data = data["data"]["translations"][0]
+        # Clean HTML character references (e.g., turning &#39; back into ')
+        clean_text = html.unescape(translation_data["translatedText"])
+        detected_lang = translation_data.get("detectedSourceLanguage", "")
+        
+        return clean_text, detected_lang
+    except Exception as e:
+        return f"[Translation Error: {e}]", ""
+
+
+# ==========================================
+# 4. WHISPER LANGUAGE CHECKER CORE
 # ==========================================
 def load_whisper_model():
     cuda_available = bool(torch and torch.cuda.is_available())
@@ -185,8 +221,19 @@ def detect_clip_language(model, clip_path):
     audio = whisper.load_audio(str(clip_path))
     audio = whisper.pad_or_trim(audio)
     mel = whisper.log_mel_spectrogram(audio, n_mels=model.dims.n_mels).to(model.device)
+    
+    # 1. Detect language distribution (for logic loops)
     _, probabilities = model.detect_language(mel)
     ranked = sorted(probabilities.items(), key=lambda item: item[1], reverse=True)
+    
+    # 2. Run local transcription clip
+    transcription = model.transcribe(str(clip_path))
+    whisper_text = transcription.get("text", "").strip()
+    
+    # 3. Cross-Translate using Official API Key
+    gt_text, gt_lang = "", ""
+    if whisper_text:
+        gt_text, gt_lang = translate_text(whisper_text, target_lang="en")
     
     return {
         "language_name": canonical_language(WHISPER_CODE_TO_LANGUAGE.get(ranked[0][0], ranked[0][0])),
@@ -194,6 +241,9 @@ def detect_clip_language(model, clip_path):
         "second_language_name": canonical_language(WHISPER_CODE_TO_LANGUAGE.get(ranked[1][0], ranked[1][0])),
         "second_confidence": float(ranked[1][1]),
         "confidence_margin": float(ranked[0][1]) - float(ranked[1][1]),
+        "whisper_text": whisper_text,
+        "gt_text": gt_text,
+        "gt_lang": gt_lang
     }
 
 def vote_whisper_samples(samples):
@@ -248,8 +298,18 @@ def run_language_checker(video_path, duration_seconds, expected_language, title,
     if not duration_seconds or duration_seconds < (CLIP_SECONDS * 2):
         return {"Lang_Predicted": "UNKNOWN", "Lang_Verdict": "HUMAN_REVIEW", "Lang_Reason": "Video duration too short or missing."}
 
-    # 2. Whisper Check
-    print(f"     Extracting audio clips via ffmpeg & running Whisper...")
+    # 2. Title Checker failed -> Fire up Google Translate + Whisper simultaneously
+    print(f"     Title checker did not determine language. Triggering Whisper & Google Cloud Translate fallbacks...")
+    
+    # Translate Title using Cloud Key as baseline context
+    gt_title_lang, gt_title_translation = "", ""
+    if title.strip():
+        gt_title_translation, gt_title_lang = translate_text(title, target_lang="en")
+        if gt_title_translation and not gt_title_translation.startswith("[Translation Error"):
+            print(f"     [GT Title Translation] Detected Code: {gt_title_lang} | Translation: {gt_title_translation}")
+
+    # Extract audio segments and evaluate side-by-side
+    print(f"     Extracting audio clips via ffmpeg & running Whisper + Google Translate...")
     starts = calculate_sample_starts(duration_seconds)
     samples = []
     
@@ -258,7 +318,11 @@ def run_language_checker(video_path, duration_seconds, expected_language, title,
         evidence = detect_clip_language(whisper_model, clip_path)
         samples.append(evidence)
         clip_path.unlink(missing_ok=True)
+        
+        # Immediate side-by-side terminal log
         print(f"       - Sample @ {start}s: {evidence['language_name']} ({evidence['confidence']:.2f})")
+        print(f"         [Whisper Audio Transcript]: {evidence['whisper_text']}")
+        print(f"         [Google Cloud Translation]: {evidence['gt_text']} (Detected source: {evidence['gt_lang']})")
 
     decision = vote_whisper_samples(samples)
     print(f"     Whisper Result: {decision['language']} | Reason: {decision['reason']}")
@@ -268,7 +332,11 @@ def run_language_checker(video_path, duration_seconds, expected_language, title,
         "Lang_Is_Match": True if not expected_language else decision["language"] == expected_language,
         "Lang_Method": "WHISPER_VOTE" if decision["accepted"] else "HUMAN_REVIEW",
         "Lang_Verdict": "WHISPER_LANGUAGE_FOUND" if decision["accepted"] else "HUMAN_REVIEW",
-        "Lang_Reason": decision["reason"]
+        "Lang_Reason": decision["reason"],
+        "GT_Title_Lang": gt_title_lang,
+        "GT_Title_Translation": gt_title_translation,
+        "Whisper_Transcripts": " | ".join(s["whisper_text"] for s in samples if s["whisper_text"]),
+        "GT_Audio_Translations": " | ".join(s["gt_text"] for s in samples if s["gt_text"])
     }
 
 def empty_language_guess():
@@ -277,12 +345,16 @@ def empty_language_guess():
         "Lang_Is_Match": "",
         "Lang_Method": "",
         "Lang_Verdict": "",
-        "Lang_Reason": ""
+        "Lang_Reason": "",
+        "GT_Title_Lang": "",
+        "GT_Title_Translation": "",
+        "Whisper_Transcripts": "",
+        "GT_Audio_Translations": ""
     }
 
 
 # ==========================================
-# 4. MAPPER CORE (Network/API)
+# 5. MAPPER CORE (Network/API)
 # ==========================================
 def load_env_file(env_path=PROJECT_ROOT / ".env"):
     if not env_path.exists(): return
@@ -299,10 +371,6 @@ def normalize_youtube_url(value):
     return f"https://www.youtube.com/watch?v={text}"
 
 def download_video(url, download_dir):
-    """
-    Downloads the absolute bare minimum required for a matching algorithm.
-    Forces 144p resolution and only downloads the first 3 minutes.
-    """
     output_template = str(download_dir / "%(id)s.%(ext)s")
     
     ydl_opts = {
@@ -320,10 +388,9 @@ def download_video(url, download_dir):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
-        # Handle duration safely if yt-dlp couldn't fetch it
         duration = info.get("duration", 0) 
         if duration > 180:
-            duration = 180  # Cap the duration for the Language Checker to 3 minutes
+            duration = 180  
 
     path = Path(filename)
     if not path.exists():
@@ -331,7 +398,6 @@ def download_video(url, download_dir):
         if matches:
             path = matches[0]
 
-    # Post-download safety buffer check
     file_size_mb = path.stat().st_size / (1024 * 1024)
     print(f"  -> Download complete! File size: {file_size_mb:.2f} MB")
     
@@ -399,14 +465,14 @@ def guess_from_payload(payload):
 
 
 # ==========================================
-# 5. MAIN PIPELINE LOOP
+# 6. MAIN PIPELINE LOOP
 # ==========================================
 def build_auto_yes_mcid_guesses(
     data_path=PROJECT_ROOT / "data" / "output_claims.csv",
     output_path=PROJECT_ROOT / "data" / "auto_yes_mcid_guesses_unified.csv",
 ):
     print("=====================================================")
-    print("      STARTING UNIFIED MAPPER & LANGUAGE PIPELINE    ")
+    print("    STARTING UNIFIED MAPPER & LANGUAGE PIPELINE    ")
     print("=====================================================")
     
     load_env_file()
@@ -441,7 +507,6 @@ def build_auto_yes_mcid_guesses(
             url = normalize_youtube_url(row[YOUTUBE_COLUMN])
             title = str(row.get(VIDEO_TITLE_COLUMN, ""))
             expected_lang = str(row.get(EXPECTED_LANGUAGE_COLUMN, ""))
-            # Fallback to WESS ID if expected text is blank
             if not expected_lang and WESS_LANGUAGE_ID_COLUMN in row:
                 expected_lang = str(row[WESS_LANGUAGE_ID_COLUMN])
 
