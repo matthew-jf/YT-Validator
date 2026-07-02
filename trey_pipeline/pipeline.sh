@@ -24,9 +24,9 @@ uv run --python 3.11 ml_pipeline/inference.py
 # echo "Generating MCID mapper guesses for Auto Yes claims..."
 # uv run --python 3.11 mcid_mapper/mcid_mapper.py
 
-# 4. Language Checker for Auto Yes claims
-echo "Generating Language guesses for Auto Yes claims..."
-uv run --python 3.11 language_checker/google_and_whisper.py
+# # 4. Language Checker for Auto Yes claims
+# echo "Generating Language guesses for Auto Yes claims..."
+# uv run --python 3.11 language_checker/google_and_whisper.py
 
 # 5. Validation / Visualization
 echo "Generating Performance Scorecards..."
