@@ -14,7 +14,7 @@ from feature_utils import engineer_features, BASE_FEATURES, AG_FEATURES
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 def run_inference(
-    data_path=PROJECT_ROOT / "data" / "may_claims.csv",
+    data_path=PROJECT_ROOT / "data" / "unprocessed_claims.csv",
     model_dir=PROJECT_ROOT / "models",
     output_path=PROJECT_ROOT / "data" / "output_claims.csv",
 ):

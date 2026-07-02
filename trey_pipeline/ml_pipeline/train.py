@@ -16,7 +16,7 @@ from feature_utils import engineer_features, BASE_FEATURES, AG_FEATURES
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 AUTOGLUON_TIME_LIMIT_SECONDS = .5 * 60 * 60
 
-def run_training(data_path=PROJECT_ROOT / "data" / "clean_all_claims.csv", model_dir=PROJECT_ROOT / "models"):
+def run_training(data_path=PROJECT_ROOT / "data" / "all_claims.csv", model_dir=PROJECT_ROOT / "models"):
     os.makedirs(model_dir, exist_ok=True)
     
     # 1. Load and slice data
