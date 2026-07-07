@@ -28,11 +28,11 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 # Columns
-AUTO_YES_COLUMN = "AG_Action"
-YOUTUBE_COLUMN = "(LINKED)    Video ID"
+AUTO_YES_COLUMN = "AG_Action" 
+YOUTUBE_COLUMN = "video_id" 
 EXPECTED_LANGUAGE_COLUMN = "Expected Language"
-WESS_LANGUAGE_ID_COLUMN = "Actual WESS Language ID"
-VIDEO_TITLE_COLUMN = "Video Title"
+WESS_LANGUAGE_ID_COLUMN = "language_id" 
+VIDEO_TITLE_COLUMN = "video_title"
 
 # Limits & Buffers
 MAX_DOWNLOAD_BYTES = 90 * 1024 * 1024  
@@ -82,28 +82,29 @@ EQUIVALENT_LANGUAGES = {
     "Persian": "Farsi, Western", "Mbandja": "Mandja", "Mandja": "Mbandja",
 }
 
-WHISPER_CODE_TO_LANGUAGE = {
-    "en": "English", "zh": "Chinese", "de": "German", "es": "Spanish", "ru": "Russian",
-    "ko": "Korean", "fr": "French", "ja": "Japanese", "pt": "Portuguese", "tr": "Turkish",
-    "pl": "Polish", "ca": "Catalan", "nl": "Dutch", "ar": "Arabic", "sv": "Swedish",
-    "it": "Italian", "id": "Indonesian", "hi": "Hindi", "fi": "Finnish", "vi": "Vietnamese",
-    "he": "Hebrew", "uk": "Ukrainian", "el": "Greek", "ms": "Malay", "cs": "Czech",
-    "ro": "Romanian", "da": "Danish", "hu": "Hungarian", "ta": "Tamil", "no": "Norwegian",
-    "th": "Thai", "ur": "Urdu", "hr": "Croatian", "bg": "Bulgarian", "lt": "Lithuanian",
-    "la": "Latin", "mi": "Maori", "ml": "Malayalam", "cy": "Welsh", "sk": "Slovak",
-    "te": "Telugu", "fa": "Persian", "lv": "Latvian", "bn": "Bengali", "sr": "Serbian",
-    "az": "Azerbaijani", "sl": "Slovenian", "kn": "Kannada", "et": "Estonian", "mk": "Macedonian",
-    "br": "Breton", "eu": "Basque", "is": "Icelandic", "hy": "Armenian", "ne": "Nepali",
-    "mn": "Mongolian", "bs": "Bosnian", "kk": "Kazakh", "sq": "Albanian", "sw": "Swahili",
-    "gl": "Galician", "mr": "Marathi", "pa": "Punjabi", "si": "Sinhala", "km": "Khmer",
-    "sn": "Shona", "yo": "Yoruba", "so": "Somali", "af": "Afrikaans", "oc": "Occitan",
-    "ka": "Georgian", "be": "Belarusian", "tg": "Tajik", "sd": "Sindhi", "gu": "Gujarati",
-    "am": "Amharic", "yi": "Yiddish", "lo": "Lao", "uz": "Uzbek", "fo": "Faroese",
-    "ht": "Haitian Creole", "ps": "Pashto", "tk": "Turkmen", "nn": "Nynorsk", "mt": "Maltese",
-    "sa": "Sanskrit", "lb": "Luxembourgish", "my": "Burmese", "bo": "Tibetan", "tl": "Tagalog",
-    "mg": "Malagasy", "as": "Assamese", "tt": "Tatar", "haw": "Hawaiian", "ln": "Lingala",
-    "ha": "Hausa", "ba": "Bashkir", "jw": "Javanese", "su": "Sundanese",
-}
+def load_wess_mapping(csv_path=PROJECT_ROOT / "data" / "WESS ID.csv"):
+    try:
+        # Load the CSV
+        wess_df = pd.read_csv(csv_path)
+        # Strip headers of hidden spaces
+        wess_df.columns = wess_df.columns.astype(str).str.strip()
+        
+        name_col = [c for c in wess_df.columns if "Language Name" in c][0]
+        id_col = [c for c in wess_df.columns if "WESS Language ID" in c][0]
+        
+        wess_dict = {}
+        for _, row in wess_df.iterrows():
+            raw_id = str(row[id_col]).split('.')[0].strip()
+            raw_name = str(row[name_col]).strip()
+            if raw_id and raw_id.lower() != 'nan':
+                wess_dict[raw_id] = raw_name
+        return wess_dict
+    except Exception as e:
+        print(f"[!] Warning: {csv_path} not found or error reading. WESS ID translation will fail. {e}")
+        return {}
+
+# Build the dictionary when the script starts
+WESS_ID_TO_LANGUAGE = load_wess_mapping()
 
 def canonical_language(value):
     value = "" if value is None else str(value).strip()
@@ -116,13 +117,19 @@ def normalize_title(text):
 
 def build_language_lookup():
     lookup = {}
+    
     def add_alias(alias, canonical, priority=False):
         alias = normalize_title(alias)
-        if not alias or (not priority and len(alias) < 5): return
+        # If priority=False, we require the language name to be at least 4 letters long 
+        # to avoid accidentally triggering on random short words in the title.
+        if not alias or (not priority and len(alias) < 4): return
         lookup[alias] = canonical_language(canonical)
         
+    # 1. Add our hardcoded high-priority list
     for lang in HIGH_PRIORITY_LANGUAGES:
         add_alias(lang, lang, priority=True)
+        
+    # 2. Add manual alias rules (MSA Arabic, Castilian, etc.)
     manual_aliases = {
         "Latin American Spanish": "Spanish", "Castilian Spanish": "Spanish", "Brazilian Portuguese": "Portuguese",
         "Modern Standard Arabic": "Arabic", "MSA Arabic": "Arabic", "Bahasa Indonesia": "Indonesian",
@@ -132,8 +139,16 @@ def build_language_lookup():
     for alias, canonical in manual_aliases.items():
         add_alias(alias, canonical, priority=True)
         
+    # 3. Dynamically absorb every language name from the WESS ID.csv
+    for wess_lang_name in WESS_ID_TO_LANGUAGE.values():
+        # Some WESS names look like "Yao (Iu Mien)". We add it as-is, and our normalize_title 
+        # function will automatically strip out the punctuation so it matches clean text.
+        add_alias(wess_lang_name, wess_lang_name, priority=False)
+        
+    # Sort by length descending, so we check for long compound names before short names
     return sorted(lookup.items(), key=lambda x: len(x[0]), reverse=True)
 
+# Build the lookup immediately after defining it
 LANGUAGE_LOOKUP = build_language_lookup()
 
 def detect_language_from_title(title):
@@ -387,7 +402,7 @@ def run_isolated_language_test(
     output_path=PROJECT_ROOT / "data" / "language_evaluation_report.csv",
 ):
     print("=====================================================")
-    print("     STARTING STANDALONE LANGUAGE EVALUATION ENGINE   ")
+    print("     STARTING STANDALONE LANGUAGE EVALUATION ENGINE  ")
     print("=====================================================")
     
     load_env_file()
@@ -417,9 +432,20 @@ def run_isolated_language_test(
         for row_number, row in eval_df.iterrows():
             url = normalize_youtube_url(row[YOUTUBE_COLUMN])
             title = str(row.get(VIDEO_TITLE_COLUMN, ""))
-            expected_lang = str(row.get(EXPECTED_LANGUAGE_COLUMN, ""))
+            
+            # 1. Check for expected language and intercept Pandas "nan" explicitly
+            expected_lang = str(row.get(EXPECTED_LANGUAGE_COLUMN, "")).strip()
+            if expected_lang.lower() == 'nan':
+                expected_lang = ""
+
+            # 2. If Expected Language is missing, translate the WESS ID using our dynamic dictionary
             if not expected_lang and WESS_LANGUAGE_ID_COLUMN in row:
-                expected_lang = str(row[WESS_LANGUAGE_ID_COLUMN])
+                raw_id = str(row[WESS_LANGUAGE_ID_COLUMN]).split('.')[0].strip()
+                if raw_id.lower() != 'nan':
+                    expected_lang = WESS_ID_TO_LANGUAGE.get(raw_id, raw_id)
+            
+            # 3. Write it back to the dataframe IMMEDIATELY so visualize.py can see it
+            eval_df.at[row_number, EXPECTED_LANGUAGE_COLUMN] = expected_lang
 
             print(f"\n=====================================================")
             print(f"Processing candidate validation link: {url}")
