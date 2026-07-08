@@ -1,28 +1,27 @@
 # /// script
 # requires-python = ">=3.11,<3.12"
-# dependencies = ["pandas", "matplotlib", "seaborn", "scikit-learn", "numpy"]
+# dependencies = ["pandas", "matplotlib", "seaborn", "scikit-learn", "numpy", "tabulate"]
 # ///
 
-#visualize.py
 from pathlib import Path
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, confusion_matrix, recall_score, fbeta_score
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 # ==========================================
-# 1. MODEL EVALUATION (XGBOOST VS AUTOGLUON)
+# 1. MODEL EVALUATION (AUTOGLUON ONLY)
 # ==========================================
 def evaluate_models(
     preds_path=PROJECT_ROOT / "data" / "output_claims.csv",
     truth_path=PROJECT_ROOT / "data" / "unprocessed_claims_Matt_MCN_MARCH1Rev.csv",
-    output_path=PROJECT_ROOT / "data" / "workload_reduction.png",
+    output_path=PROJECT_ROOT / "data" / "workload_reduction_ag.png",
 ):
     print("\n" + "="*65)
-    print("           MODEL PERFORMANCE & WORKLOAD REDUCTION")
+    print("           AUTOGLUON PERFORMANCE & WORKLOAD REDUCTION")
     print("="*65)
     
     try:
@@ -61,38 +60,135 @@ def evaluate_models(
         fns = ((valid_cases['Actual_Binary'] == 1) & (valid_cases[action_col] == 'Auto No')).sum()
         return rate, acc, fns
 
-    # Calculate for both models
-    xgb_rate, xgb_acc, xgb_fns = calc_metrics('XGB_Action')
+    # Calculate for AutoGluon
     ag_rate, ag_acc, ag_fns = calc_metrics('AG_Action')
     
-    # Generate Text Report
-    print(f"XGBoost   | Automation: {xgb_rate:.2f}% | Accuracy: {xgb_acc:.2f}% | False Negatives: {xgb_fns}")
+    # Generate Original Text Report
     print(f"AutoGluon | Automation: {ag_rate:.2f}% | Accuracy: {ag_acc:.2f}% | False Negatives: {ag_fns}")
     print("="*65)
 
-    # Generate Workload Reduction Chart
-    if 'XGB_Action' in valid_cases.columns and 'AG_Action' in valid_cases.columns:
-        plt.figure(figsize=(10, 6))
-        actions_df = pd.melt(valid_cases[['XGB_Action', 'AG_Action']], var_name='Model', value_name='Action')
+    # ---------------------------------------------------------
+    # ORIGINAL CHART: Workload Reduction Chart
+    # ---------------------------------------------------------
+    if 'AG_Action' in valid_cases.columns:
+        plt.figure(figsize=(8, 6))
         
-        sns.countplot(
-            data=actions_df, 
-            x='Model', 
-            hue='Action', 
+        ax = sns.countplot(
+            data=valid_cases, 
+            x='AG_Action', 
             palette='muted', 
-            order=['XGB_Action', 'AG_Action'],
-            hue_order=['Auto Yes', 'Human Review', 'Auto No']
+            order=['Auto Yes', 'Human Review', 'Auto No']
         )
         
-        plt.title('Manual Workload Reduction: XGBoost vs AutoGluon')
-        plt.ylabel('Number of Claims')
+        for container in ax.containers:
+            ax.bar_label(container, padding=3, fontsize=11)
+            
+        plt.title('Manual Workload Reduction: AutoGluon', fontsize=14, pad=12)
+        plt.xlabel('AI Recommended Action', fontsize=11, labelpad=8)
+        plt.ylabel('Number of Claims', fontsize=11, labelpad=8)
         plt.tight_layout()
         
         output_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(output_path)
-        print(f"[#] Saved workload visualization to '{output_path}'")
+        plt.close()
+        print(f"[#] Saved workload visualization to '{output_path.name}'")
     else:
-        print("Missing 'XGB_Action' or 'AG_Action' columns. Cannot generate plot.")
+        print("Missing 'AG_Action' column. Cannot generate plot.")
+
+    # ---------------------------------------------------------
+    # NEW: Advanced Risk & Operational Scorecard Calculations
+    # ---------------------------------------------------------
+    print("\n" + "="*75)
+    print(" AUTOGLUON ADVANCED PERFORMANCE REPORT")
+    print("="*75)
+    metrics_summary = []
+
+    action_col = 'AG_Action'
+    if action_col in valid_cases.columns:
+            
+        auto_subset = valid_cases[valid_cases[action_col] != 'Human Review'].copy()
+
+        if len(auto_subset) > 0:
+            y_true = auto_subset['verdict'].map({'Y': 1, 'N': 0}).astype(int)
+            y_pred = auto_subset[action_col].map({'Auto Yes': 1, 'Auto No': 0}).astype(int)
+
+            tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+
+            automation_rate = (len(auto_subset) / len(valid_cases)) * 100
+            accuracy = ((tp + tn) / len(auto_subset)) * 100
+            recall = recall_score(y_true, y_pred, zero_division=0) * 100
+            npv = (tn / (tn + fn)) * 100 if (tn + fn) > 0 else 0
+            f2 = fbeta_score(y_true, y_pred, beta=2, zero_division=0) * 100
+
+            metrics_summary.append({
+                'Model': 'AutoGluon',
+                'Automation Rate': f"{automation_rate:.2f}%",
+                'Automated Accuracy': f"{accuracy:.2f}%",
+                'Recall (Safety)': f"{recall:.2f}%",
+                'NPV (Auto-No Purity)': f"{npv:.2f}%",
+                'F2-Score (Weighted)': f"{f2:.2f}%",
+                'False Negatives': fn
+            })
+
+    if metrics_summary:
+        scores_df = pd.DataFrame(metrics_summary)
+        print(scores_df.to_markdown(index=False))
+        print("\n* Recall (Safety): Higher means fewer valid claims were accidentally rejected.")
+        print("* NPV (Auto-No Purity): Higher means your automated rejection bucket is cleaner.")
+        print("* F2-Score: Weighted metric penalizing False Negatives twice as harshly as False Positives.")
+        print("="*75)
+
+    # ---------------------------------------------------------
+    # CHART 1: Confusion Matrix Heatmap
+    # ---------------------------------------------------------
+    if 'AG_Action' in valid_cases.columns:
+        action_order = ['Auto Yes', 'Auto No', 'Human Review']
+        verdict_order = ['Y', 'N']
+
+        crosstab_ag = pd.crosstab(valid_cases['verdict'], valid_cases['AG_Action'])
+        crosstab_ag = crosstab_ag.reindex(index=verdict_order, columns=action_order, fill_value=0)
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+        sns.heatmap(
+            crosstab_ag, annot=True, fmt='d', cmap='Blues', cbar=False,
+            annot_kws={'size': 16}, ax=ax
+        )
+        
+        ax.set_title('AutoGluon: Prediction vs. Actual', fontsize=14, pad=12, weight='bold')
+        ax.set_xlabel('AI Recommended Action', fontsize=11, labelpad=8)
+        ax.set_ylabel('Actual Verdict (Historical)', fontsize=11, labelpad=8)
+
+        plt.tight_layout()
+        cm_output = output_path.parent / "confusion_matrix_ag.png"
+        plt.savefig(cm_output, bbox_inches='tight')
+        plt.close()
+        print(f"[#] Saved confusion matrix to '{cm_output.name}'")
+
+        # ---------------------------------------------------------
+        # CHART 2: Operational Bar Chart
+        # ---------------------------------------------------------
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+        ax_ag = sns.countplot(
+            data=valid_cases, x='AG_Action', hue='verdict',
+            palette={'Y': '#2ecc71', 'N': '#e74c3c'},
+            order=action_order, hue_order=verdict_order, ax=ax
+        )
+        
+        for container in ax_ag.containers:
+            ax_ag.bar_label(container, padding=3, fontsize=11)
+
+        ax.set_title('AutoGluon Volume Breakdown', fontsize=14, pad=12, weight='bold')
+        ax.set_xlabel('AI Recommended Action', fontsize=11, labelpad=8)
+        ax.set_ylabel('Number of Claims', fontsize=11, labelpad=8)
+        ax.legend(title='Actual Verdict', loc='upper right')
+
+        plt.tight_layout()
+        op_output = output_path.parent / "operational_breakdown_ag.png"
+        plt.savefig(op_output, bbox_inches='tight')
+        plt.close()
+        print(f"[#] Saved operational breakdown to '{op_output.name}'")
 
 
 # ==========================================
@@ -183,7 +279,8 @@ def evaluate_language(
             
             output_path.parent.mkdir(parents=True, exist_ok=True)
             plt.savefig(output_path, dpi=300)
-            print(f"[#] Saved language visualization to '{output_path}'\n")
+            print(f"[#] Saved language visualization to '{output_path.name}'\n")
+            plt.close()
         else:
             print("[!] No valid language data available to plot.")
     else:
