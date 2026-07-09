@@ -15,9 +15,12 @@ The project is broken down into distinct, logical components to separate feature
 
 * **`feature_utils.py`**: The shared engine. It houses the data cleaning, duration mathematics, and fuzzy string-matching logic (via `thefuzz`). Centralizing this ensures that the exact same transformations are applied to both historical training data and new, unseen inference data.
 * **`train.py`**: The model generation script. It ingests historical data, trains the baseline and challenger models, calibrates the safety thresholds, and outputs the artifacts to the `models/` directory.
+NOTE: If you want to train a model on the new data, you'll have the change the data path on line 19 of the file.
 * **`inference.py`**: The operational script. It loads the pre-trained models and applies them to new, incoming monthly CSVs without needing to retrain.
+NOTE: If when running new data through the pipeline, you'll have to change the data path in line 17 of the file.
 * **`visualize.py`**: The performance scorecard generator. If ground truth data is available, it calculates automation rates, accuracy, and false negatives, outputting a Seaborn chart (`workload_reduction.png`).
 * **`pipeline.sh`**: The master orchestrator. A single bash script that checks for existing models, trains them if missing, runs inference, and generates visualizations automatically.
+NOTE: When running through the pipeline, it skips over any step where the expected output file exists. Ex. If you run through June data, you'll get an output_claims.csv. If you forget to remove or rename that file and try to run through July, the pipeline will skip over the inference.
 
 ---
 
