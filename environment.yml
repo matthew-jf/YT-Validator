@@ -6,12 +6,14 @@ channels:
   - conda-forge
 dependencies:
   - python=3.11
-  - scikit-learn
-  - xgboost
   - google-api-python-client
   - pandas
   - numpy
-  - openai
   - tqdm
   - python-dotenv
   - flask
+  - pip
+  - pip:
+      # Pinned to the version that trained trey_pipeline/models/ag_challenger
+      - autogluon.tabular[lightgbm,catboost]==1.5.0
+      - thefuzz

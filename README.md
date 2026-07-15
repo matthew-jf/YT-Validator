@@ -17,19 +17,19 @@ sudo /opt/miniconda3/bin/conda env update -n YT-Validator -f /opt/yt-validator/e
 sudo systemctl restart yt-validator
 ```
 
-Uncompress training data:
-
-```shell
-7z x YT.csv.7z
-```
-
 Configure secrets via `.env` `cp .env.example .env` and edit .env with your keys
 Or export required envs:
 
 ```shell
 YT_API_KEY=AIza...                # Grab free from GCP console - 1 unit per 50 videos capped at 10k units/day.
-OPENAI_API_KEY=sk-proj-...
 ```
+
+## Model
+
+Predictions come from the pretrained AutoGluon challenger stack in
+`trey_pipeline/models/ag_challenger` (with its calibrated Human-Review
+threshold in `trey_pipeline/models/ag_threshold.json`). No training happens at
+runtime; to retrain, see `trey_pipeline/Machine_Learning_Pipeline.md`.
 
 ## CLI 
 
@@ -38,11 +38,7 @@ Run with inference data as only required argument:
 ```shell
 python pipeline.py \
   --prediction-input /Users/matthew.jurewicz/Downloads/export_unprocessed_claims_202507241337.csv
-  --skip-validation 
 ```
-
-Fits by default `YT.csv` if found, else requires training data
-eg. `--training-data /Users/matthew.jurewicz/Downloads/export_all_claims_202507241336.csv`.
 
 
 ## API
@@ -71,8 +67,7 @@ Response includes git branch/commit for deploy verification:
 curl -X POST http://localhost:3001/predict \
   -F "file=@$HOME/Downloads/export_unprocessed_claims_202509031526.csv" \
   -F "webhook_url=http://localhost:3000/api/ml-webhook" \
-  -F "pipeline_run_id=68d88bd07c95b16053ef569a" \
-  -F "skip_validation=true" 
+  -F "pipeline_run_id=68d88bd07c95b16053ef569a"
 ```
 
 Only required arg is input file.
