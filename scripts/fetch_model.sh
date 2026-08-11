@@ -53,8 +53,11 @@ else
   fi
 fi
 
-# The threshold lives beside the artifact, not inside it.
-if [ ! -s "$DEST_ROOT/ag_threshold.json" ]; then
+# The threshold lives beside the artifact, not inside it, and belongs to the
+# model version -- a different model implies a different calibrated threshold.
+# Always refetch so a stale local copy cannot silently outrank the published
+# one.
+if true; then
   echo "Fetching ag_threshold.json"
   if command -v gcloud >/dev/null 2>&1; then
     gcloud storage cp "${MODEL_BUCKET%/}/$MODEL_VERSION/ag_threshold.json" "$DEST_ROOT/"

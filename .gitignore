@@ -14,3 +14,6 @@ trey_pipeline/models/ag_challenger_deploy/
 
 .env*
 !.env.example
+
+# Model artifact is served from GCS (scripts/fetch_model.sh), not git.
+trey_pipeline/models/ag_challenger/
