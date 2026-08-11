@@ -3,6 +3,8 @@ from datetime import datetime
 import json
 import os
 import sys
+import threading
+import time
 import warnings
 from pathlib import Path
 
@@ -26,7 +28,12 @@ warnings.filterwarnings('ignore')
 # maker) + calibrated Human-Review threshold. See trey_pipeline/.
 # ---------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parent
-MODEL_DIR = REPO_ROOT / 'trey_pipeline' / 'models'
+MODEL_DIR = Path(os.environ.get('MODEL_DIR', REPO_ROOT / 'trey_pipeline' / 'models'))
+
+# Which artifact under MODEL_DIR to serve. 'ag_challenger' is the full training
+# output; 'ag_challenger_deploy' is the pruned inference-only clone produced by
+# trey_pipeline/ml_pipeline/export_deploy.py (same predictions, 55% smaller).
+MODEL_NAME = os.environ.get('MODEL_NAME', 'ag_challenger')
 
 sys.path.insert(0, str(REPO_ROOT / 'trey_pipeline' / 'ml_pipeline'))
 from feature_utils import engineer_features, AG_FEATURES
@@ -40,10 +47,82 @@ REQUIRED_INPUT_COLUMNS = [
     'duration_seconds', 'matching_duration', 'longest_match',
 ]
 
+# The artifact is ~1.4 GB on disk and takes seconds to deserialise, so it is
+# loaded once per process rather than once per request. app.py warms this at
+# startup so a broken artifact fails the service immediately instead of
+# surfacing inside a background task.
+_PREDICTOR = None
+_REVIEW_THRESHOLD = None
+_MODEL_LOAD_SECONDS = None
+_WARM_SECONDS = None
+_LOAD_LOCK = threading.Lock()
+
 
 class TaskStoppedError(Exception):
     """Custom exception to indicate task was stopped."""
     pass
+
+
+def peak_rss_mb():
+    """Process high-water memory mark, in MB. ru_maxrss is bytes on macOS, KB on Linux."""
+    try:
+        import resource
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return round(peak / (1048576 if sys.platform == 'darwin' else 1024), 1)
+    except Exception:
+        return None
+
+
+def get_predictor():
+    """Return (predictor, review_threshold), loading once per process."""
+    global _PREDICTOR, _REVIEW_THRESHOLD, _MODEL_LOAD_SECONDS
+    if _PREDICTOR is None:
+        with _LOAD_LOCK:
+            if _PREDICTOR is None:  # another thread may have won the race
+                started = time.time()
+                predictor = TabularPredictor.load(str(MODEL_DIR / MODEL_NAME))
+                with open(MODEL_DIR / 'ag_threshold.json') as f:
+                    _REVIEW_THRESHOLD = json.load(f)['threshold']
+                _MODEL_LOAD_SECONDS = time.time() - started
+                _PREDICTOR = predictor
+    return _PREDICTOR, _REVIEW_THRESHOLD
+
+
+def warm_predictor():
+    """Force the model files off disk and into memory.
+
+    TabularPredictor.load() only reads predictor/learner metadata; AutoGluon
+    defers loading the model files themselves until the first predict. So a
+    plain load neither pays the real cost nor detects a corrupt model file.
+    Scoring one synthetic row forces both.
+    """
+    global _WARM_SECONDS
+    predictor, _ = get_predictor()
+    started = time.time()
+    probe = pandas.DataFrame([{
+        'duration_diff_sec': 0.0, 'duration_ratio': 1.0,
+        'title_fuzzy_ratio': 100, 'title_token_sort_ratio': 100,
+        'title_token_set_ratio': 100, 'matching_duration': 60.0,
+        'longest_match': 60.0, 'video_title': 'warmup', 'asset_title': 'warmup',
+    }])
+    predictor.predict_proba(probe[AG_FEATURES])
+    _WARM_SECONDS = time.time() - started
+    return _WARM_SECONDS
+
+
+def model_info():
+    """Describe the loaded model, for /health and telemetry."""
+    return {
+        'model_dir': str(MODEL_DIR / MODEL_NAME),
+        'loaded': _PREDICTOR is not None,
+        'model_best': getattr(_PREDICTOR, 'model_best', None),
+        'review_threshold': _REVIEW_THRESHOLD,
+        'auto_yes_threshold': AUTO_YES_THRESHOLD,
+        'load_seconds': round(_MODEL_LOAD_SECONDS, 2) if _MODEL_LOAD_SECONDS else None,
+        'warm_seconds': round(_WARM_SECONDS, 2) if _WARM_SECONDS else None,
+        'warm': _WARM_SECONDS is not None,
+        'peak_rss_mb': peak_rss_mb(),
+    }
 
 
 # Function to check if YouTube videos are available
@@ -84,25 +163,27 @@ def main(args, status_callback=None, stop_check=None):
             message = f"Task stopped during {stage if stage else 'by user'}"
             raise TaskStoppedError(message)
 
+    telemetry = {'rows': 0}
+    run_started = time.time()
+
     # -----------------------------------------------------------------------
-    # Load pretrained model artifacts
+    # Load pretrained model artifacts (cached after the first call)
     # -----------------------------------------------------------------------
     msg = "Loading AutoGluon challenger model"
     check_stopped(msg)
     if status_callback:
         status_callback(msg)
 
-    predictor = TabularPredictor.load(str(MODEL_DIR / 'ag_challenger'))
-    with open(MODEL_DIR / 'ag_threshold.json') as f:
-        review_threshold = json.load(f)['threshold']
+    predictor, review_threshold = get_predictor()
+    telemetry['model_load_seconds'] = _MODEL_LOAD_SECONDS
 
     # -----------------------------------------------------------------------
     # Load licensed assets and asset->media_component mapping
     # -----------------------------------------------------------------------
-    licensed_df = pandas.read_csv('Licensed.csv')
+    licensed_df = pandas.read_csv(REPO_ROOT / 'Licensed.csv')
     licensed_asset_ids = set(licensed_df['asset_id'].dropna().unique())
 
-    assets_media_df = pandas.read_csv('assets_single_media_component.csv')
+    assets_media_df = pandas.read_csv(REPO_ROOT / 'assets_single_media_component.csv')
     asset_to_media_component = dict(zip(assets_media_df['asset_id'],
                                         assets_media_df['media_component_id']))
 
@@ -154,7 +235,10 @@ def main(args, status_callback=None, stop_check=None):
     if status_callback:
         status_callback(msg)
 
+    predict_started = time.time()
     df['rating'] = predictor.predict_proba(features[AG_FEATURES]).iloc[:, 1].to_numpy()
+    telemetry['predict_seconds'] = round(time.time() - predict_started, 2)
+    telemetry['rows'] = len(df)
 
     # Trey's operational three-way decision, using the calibrated threshold
     df['action'] = np.where(
@@ -176,6 +260,13 @@ def main(args, status_callback=None, stop_check=None):
 
     # Save predictions
     df.to_csv(args.prediction_output, index=False)
+
+    # Resource footprint, so production behaviour is observable rather than
+    # inferred. peak_rss_mb is the high-water mark for the whole process.
+    telemetry['total_seconds'] = round(time.time() - run_started, 2)
+    telemetry['peak_rss_mb'] = peak_rss_mb()
+    telemetry['actions'] = df['action'].value_counts().to_dict()
+    return telemetry
 
 
 if __name__ == "__main__":
