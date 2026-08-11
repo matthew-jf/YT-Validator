@@ -1,2 +1,17 @@
+# Git LFS is for files git cannot carry, not for every file of a given type.
+#
+# The previous blanket rules (`*.csv`, `*.pkl`) came in via commit 5f662ca
+# "Add files via upload" and swept up two ~20 KB lookup tables. Any clone
+# without git-lfs then produced ~130-byte pointer stubs in their place, which
+# load as garbage -- the service reported healthy while every prediction
+# failed. Small files belong in plain git so a plain clone always works.
+
+# Training and evaluation datasets: all_claims.csv alone is 225 MB, well past
+# GitHub's 100 MB per-file limit.
+trey_pipeline/data/*.csv filter=lfs diff=lfs merge=lfs -text
+
+# Model artifacts. The RandomForest files are ~687 MB each.
+# Superseded once the artifact is served from GCS -- see scripts/fetch_model.sh
+# and scripts/upload_model.sh. Drop this rule and `git rm --cached` the model
+# files after the bucket is seeded.
 *.pkl filter=lfs diff=lfs merge=lfs -text
-*.csv filter=lfs diff=lfs merge=lfs -text
