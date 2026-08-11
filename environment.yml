@@ -7,8 +7,14 @@ channels:
 dependencies:
   - python=3.11
   - google-api-python-client
-  - pandas
-  - numpy
+  # Bounded to match autogluon 1.5.0's own requirements. Left unpinned, conda
+  # resolves to the newest release: pandas 3.0 removed the `downcast` argument
+  # that autogluon's fillna generator still passes, so the service crash-loops
+  # on `TypeError: NDFrame.fillna() got an unexpected keyword argument
+  # 'downcast'`. The upper bounds are what makes this file reproducible over
+  # time rather than "whatever was current on build day".
+  - pandas>=2.0.0,<2.4.0
+  - numpy>=1.25.0,<2.4.0
   - tqdm
   - python-dotenv
   - flask
