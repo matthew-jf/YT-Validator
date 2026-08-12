@@ -1,4 +1,5 @@
-# Keep env loading first, Gunicorn/Flask import app.py as a module
+# Keep env loading first: a WSGI server imports app.py as a module, so this
+# must run before anything reads the environment.
 from helpers import load_env
 load_env(["YT_API_KEY"])
 
@@ -259,7 +260,7 @@ if os.getenv("WARM_MODEL", "1") != "0":
 if __name__ == '__main__':
 
     host = os.getenv("FLASK_RUN_HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", os.getenv("FLASK_RUN_PORT", "3001")))  # So PORT env also works
+    port = int(os.getenv("FLASK_RUN_PORT", "3001"))
     debug = os.getenv("FLASK_DEBUG", "0") == "1"
 
     # The reloader re-imports this module in a child process, which would load
