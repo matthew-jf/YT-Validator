@@ -3,6 +3,10 @@
 .vscode/
 __pycache__/
 data/
+
+# Build output of trey_pipeline/ml_pipeline/export_deploy.py -- derived from the
+# trained artifact and published to GCS, never committed.
+trey_pipeline/models/ag_challenger_deploy/
 *.csv
 !Licensed.csv
 !assets_single_media_component.csv
@@ -10,3 +14,6 @@ data/
 
 .env*
 !.env.example
+
+# Model artifact is served from GCS (scripts/fetch_model.sh), not git.
+trey_pipeline/models/ag_challenger/

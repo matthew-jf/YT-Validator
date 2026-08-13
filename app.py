@@ -1,6 +1,7 @@
-# Keep env loading first, Gunicorn/Flask import app.py as a module
+# Keep env loading first: a WSGI server imports app.py as a module, so this
+# must run before anything reads the environment.
 from helpers import load_env
-load_env(["YT_API_KEY", "OPENAI_API_KEY"])
+load_env(["YT_API_KEY"])
 
 
 from flask import Flask, request, jsonify, send_file
@@ -19,17 +20,63 @@ app = Flask(__name__)
 tasks = TaskStore()
 GIT_BRANCH, GIT_COMMIT = get_git_info()
 
+# The model is ~1.4 GB and one scoring run saturates the available cores, so
+# runs are serialised. Concurrent runs would only contend for CPU while
+# multiplying peak memory.
+INFERENCE_SLOT = threading.Semaphore(1)
+
+
+def reconcile_orphaned_tasks():
+    """Fail tasks left 'running' by a crash or restart.
+
+    systemd restarts this service automatically, but a task interrupted
+    mid-run stays 'running' in tasks.json forever and its webhook never
+    fires, so the caller waits indefinitely. Nothing survives a restart, so
+    any task still marked running at startup is dead by definition.
+    """
+    orphaned = [tid for tid, t in tasks.items() if t.get('status') == 'running']
+    for tid in orphaned:
+        tasks[tid]['status'] = 'failed'
+        tasks[tid]['error'] = 'Service restarted while task was running'
+    if orphaned:
+        tasks.save()
+        print(f"Reconciled {len(orphaned)} orphaned task(s): {', '.join(orphaned)}")
+    return orphaned
+
+
+def warm_model():
+    """Load the model at startup so a broken artifact fails loudly and early.
+
+    Without this the first request pays the load cost, and a corrupt or
+    missing artifact only surfaces inside a background thread where it
+    reaches the caller as an opaque task failure.
+    """
+    from pipeline import warm_predictor, model_info
+    started = time.time()
+    warm_predictor()
+    print(f"Model ready in {time.time() - started:.1f}s: {model_info()}")
+
 
 @app.route('/health')
 def health_check():
+    """Report unhealthy unless the model is actually loaded.
+
+    A bare 200 here is how a broken artifact (e.g. unresolved Git LFS
+    pointers) stayed invisible until the first prediction failed.
+    """
+    from pipeline import model_info
+    info = model_info()
+    healthy = bool(info.get('loaded') and info.get('warm'))
     return jsonify({
-        'status': 'healthy',
+        'status': 'healthy' if healthy else 'unhealthy',
         'service': 'YT-Validator',
         'version': '1.0.0',
         'branch': GIT_BRANCH,
         'commit': GIT_COMMIT,
+        'model': info,
+        'running_tasks': sum(1 for t in tasks.values() if t.get('status') == 'running'),
         'timestamp': time.time()
-    })
+    }), (200 if healthy else 503)
 
 
 @app.route('/predict', methods=['POST'])
@@ -138,21 +185,31 @@ def run_prediction(task_id, args):
         return tasks[task_id].get('stopped', False)
 
     try:
-        
+
         from pipeline import main
-        main(args, status_callback=update_status, stop_check=should_stop)
+
+        # Serialise scoring runs; see INFERENCE_SLOT.
+        waiting_since = time.time()
+        with INFERENCE_SLOT:
+            queued = time.time() - waiting_since
+            if queued > 1:
+                update_status(f"Waited {queued:.0f}s for the inference slot")
+            telemetry = main(args, status_callback=update_status, stop_check=should_stop)
 
         if should_stop():
             tasks[task_id]['status'] = 'stopped'
             tasks.save()
             return
-        
+
         # Task completed. Load the CSV that was saved
         result_df = pd.read_csv(args.prediction_output)
         update_status(f"Completed ({len(result_df)} rows) → {args.prediction_output}")
 
         tasks[task_id]['status'] = 'completed'
         tasks[task_id]['csv_path'] = args.prediction_output
+        if telemetry:
+            tasks[task_id]['telemetry'] = telemetry
+            print(f"[telemetry] {task_id}: {telemetry}")
         tasks.save()
 
         # Notify webhook of background task completion
@@ -192,9 +249,20 @@ def notify_completion(webhook_url, task_id, pipeline_run_id, num_results):
                 print(f"Webhook notification failed: {e}")
 
 
+# Run at import, not under __main__, so this also applies when a WSGI server
+# imports app.py as a module. WARM_MODEL=0 skips the load for tests and for
+# CLI use that never scores anything.
+reconcile_orphaned_tasks()
+if os.getenv("WARM_MODEL", "1") != "0":
+    warm_model()
+
+
 if __name__ == '__main__':
-    
+
     host = os.getenv("FLASK_RUN_HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", os.getenv("FLASK_RUN_PORT", "3001")))  # So PORT env also works
+    port = int(os.getenv("FLASK_RUN_PORT", "3001"))
     debug = os.getenv("FLASK_DEBUG", "0") == "1"
-    app.run(host=host, port=port, debug=debug)
+
+    # The reloader re-imports this module in a child process, which would load
+    # the model twice and double peak memory.
+    app.run(host=host, port=port, debug=debug, use_reloader=False)
