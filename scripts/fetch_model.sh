@@ -27,9 +27,21 @@ fi
 
 SRC="${MODEL_BUCKET%/}/$MODEL_VERSION/$MODEL_NAME"
 
-if [ "$FORCE" != "1" ] && [ -s "$DEST/predictor.pkl" ]; then
+# "Present" must mean usable, not merely non-empty: a checkout without git-lfs
+# leaves ~130-byte pointer stubs, which are non-empty and would otherwise be
+# mistaken for a real artifact and skipped.
+is_usable() {
+  [ -s "$DEST/predictor.pkl" ] || return 1
+  head -c 40 "$DEST/predictor.pkl" 2>/dev/null | grep -q "git-lfs.github.com" && return 1
+  return 0
+}
+
+if [ "$FORCE" != "1" ] && is_usable; then
   echo "Model already present at $DEST (FORCE=1 to refetch)"
 else
+  if [ -e "$DEST/predictor.pkl" ] && ! is_usable; then
+    echo "Existing artifact at $DEST is an unresolved LFS pointer; replacing it."
+  fi
   echo "Fetching $SRC -> $DEST"
   mkdir -p "$DEST_ROOT"
   rm -rf "$DEST"
@@ -41,8 +53,11 @@ else
   fi
 fi
 
-# The threshold lives beside the artifact, not inside it.
-if [ ! -s "$DEST_ROOT/ag_threshold.json" ]; then
+# The threshold lives beside the artifact, not inside it, and belongs to the
+# model version -- a different model implies a different calibrated threshold.
+# Always refetch so a stale local copy cannot silently outrank the published
+# one.
+if true; then
   echo "Fetching ag_threshold.json"
   if command -v gcloud >/dev/null 2>&1; then
     gcloud storage cp "${MODEL_BUCKET%/}/$MODEL_VERSION/ag_threshold.json" "$DEST_ROOT/"
