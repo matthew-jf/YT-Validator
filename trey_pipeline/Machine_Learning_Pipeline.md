@@ -12,6 +12,7 @@ inference loads a pretrained artifact. For what gets served and how, see
 | `ml_pipeline/train.py` | trains the XGBoost baseline and AutoGluon ensemble, calibrates the review threshold, writes to `models/` |
 | `ml_pipeline/export_deploy.py` | prunes a trained artifact to an inference-only clone (~3.1 GB → ~1.4 GB) |
 | `ml_pipeline/verify_deploy.py` | asserts a pruned artifact predicts identically to its source |
+| `ml_pipeline/grade_against_verdicts.py` | grades a claims export against human verdicts — the production-format counterpart to `visualize.py` |
 | `ml_pipeline/visualize.py` | scorecard against human-adjudicated ground truth |
 | `pipeline.sh` | orchestrator for the train → infer → visualize loop, via `uv` |
 
@@ -72,10 +73,32 @@ Nothing in `pipeline.py` names a model.
 
 ## Evaluation
 
-Prefer `visualize.py`, which scores predictions on `unprocessed_claims` against
-the human verdicts in the MARCH1Rev file. Report **balanced accuracy**, not
-accuracy — positives are ~12% of that set, so accuracy is dominated by the
-majority class.
+Use `grade_against_verdicts.py`, which takes any claims export plus its
+reviewed verdicts file, scores it, applies the production decision rules and
+reports the comparison:
+
+```bash
+python ml_pipeline/grade_against_verdicts.py <claims.csv> <verdicts.csv>
+```
+
+It reuses the `licensed` / `video_available` already in the export instead of
+re-checking YouTube, so an old snapshot is graded as it stood at the time
+rather than against today's availability.
+
+Report **balanced accuracy**, not accuracy — positives are a minority, so
+accuracy is dominated by the majority class.
+
+`visualize.py` does something similar and adds charts, but reads `AG_Action`,
+which only `inference.py` produces. It cannot grade production output, where
+the columns are `rating` / `action`.
+
+> **The March benchmark flattered the model.** Graded against July's 4,470
+> human verdicts — a population with no overlap at all with training — it
+> auto-rejects **36% of valid claims** (403 of 1,108), against 6.6% on
+> MARCH1Rev. AUC falls from 0.91 to 0.80, and the median score for a valid
+> claim drops from 0.93 to 0.45. Only 39 of those misses come from the
+> licensed/unavailable rule; the rest are the model. Treat July as the
+> realistic number.
 
 > **`train.py`'s own train/test split is not a clean holdout.** 26.3% of its test
 > rows share an exact feature-vector with a training row — nine coarse features
