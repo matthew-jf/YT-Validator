@@ -17,11 +17,24 @@ sudo /opt/miniconda3/bin/conda env update -n YT-Validator -f /opt/yt-validator/e
 sudo systemctl restart yt-validator
 ```
 
-Uncompress training data:
+## Model
 
-```shell
-7z x YT.csv.7z
-```
+The pipeline caches the fitted model (plus tuned decision threshold and triage
+cutoffs) to `model.joblib`. If the artifact exists, training is skipped. Delete
+it to retrain — training then requires `--training-data` (a claims export with
+`verdict`, and optionally `no_code`).
+
+Training details: claims with rule-driven verdicts (`no_code` L/V/N/X) are
+excluded, claims from 2022+ are used, and the most recent ~5 months are held
+out to tune the Y/N decision threshold (max balanced accuracy) and the triage
+cutoffs (auto buckets held to >= 95% accuracy on the holdout).
+
+Note on triage cutoffs: holdout-calibrated cutoffs proved optimistic on a real
+unprocessed batch (holdout claims are easier than monthly leftovers). The
+shipped `model.joblib` has cutoffs recalibrated on the July 2026 reviewed batch
+(AUTO_N/AUTO_Y both ~97% accurate there). After retraining, prefer
+recalibrating cutoffs against the most recent reviewed batch by comparing a
+prediction run's raw probabilities to the human verdicts.
 
 Configure secrets via `.env` `cp .env.example .env` and edit .env with your keys
 Or export required envs:
@@ -40,8 +53,19 @@ python pipeline.py \
   --skip-validation 
 ```
 
-Fits by default `YT.csv` if found, else requires training data
+Uses cached `model.joblib` if found, else requires training data
 eg. `--training-data /Users/matthew.jurewicz/Downloads/export_all_claims_202507241336.csv`.
+
+If the input CSV already has a `video_available` column it is reused and the
+YouTube API is not called (no `YT_API_KEY` needed for such offline runs).
+
+Output CSV = input columns plus:
+
+- `licensed`, `media_component_id`, `video_available` — enrichment (as before)
+- `rating` — model probability of verdict Y, forced to 0 for licensed assets and unavailable videos (as before)
+- `predicted_verdict` — Y/N at the tuned threshold, after the licensed/unavailable rules
+- `confidence` — max(p, 1-p) of the raw model probability
+- `triage` — `AUTO_N_LICENSED` / `AUTO_N_UNAVAILABLE` / `AUTO_N` / `AUTO_Y` (auto-decidable at >= 95% holdout accuracy) or `REVIEW` (route to manual review)
 
 
 ## API

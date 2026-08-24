@@ -6,6 +6,7 @@ data/
 *.csv
 !Licensed.csv
 !assets_single_media_component.csv
+*.joblib
 
 .env*
 !.env.example
