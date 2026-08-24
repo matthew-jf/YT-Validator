@@ -197,7 +197,7 @@ def main(args, status_callback=None, stop_check=None):
 
     df = pandas.read_csv(args.prediction_input, engine='python',
                          on_bad_lines='skip', encoding='utf-8-sig')
-    df.columns = df.columns.astype(str).str.strip().str.replace('\ufeff', '')
+    df.columns = df.columns.astype(str).str.strip()
 
     missing = [c for c in REQUIRED_INPUT_COLUMNS if c not in df.columns]
     if missing:

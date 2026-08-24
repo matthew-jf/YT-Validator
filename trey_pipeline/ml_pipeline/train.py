@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 import xgboost as xgb
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 from autogluon.tabular import TabularPredictor
 from feature_utils import engineer_features, BASE_FEATURES, AG_FEATURES
 
@@ -21,21 +21,26 @@ def run_training(data_path=PROJECT_ROOT / "data" / "all_claims.csv", model_dir=P
     
     # 1. Load and slice data
     df = pd.read_csv(data_path, engine='python', on_bad_lines='skip', encoding='utf-8-sig')
-    df.columns = df.columns.astype(str).str.strip().str.replace('\ufeff', '')
+    df.columns = df.columns.astype(str).str.strip()
     
     verdict_col = 'Ver-dict' if 'Ver-dict' in df.columns else [c for c in df.columns if 'verdict' in c.lower()][0]
     valid_cases = df[df['verdict'].isin(['Y', 'N'])].copy()
     
     y = valid_cases[verdict_col].map({'Y': 1, 'N': 0})
-    X_raw = valid_cases.iloc[:, :58].copy()
+    X_raw = valid_cases.drop(columns=[verdict_col])
     
     print("Engineering features...")
     X_processed = engineer_features(X_raw)
     
-    # 2. Train/Test Split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_processed, y, test_size=0.2, random_state=42, stratify=y
-    )
+    # 2. Train/Test Split, grouped by feature-vector
+    # different claims (even from different assets) often share all 9 features. standard train_test_split scattered
+    # those duplicates across the train/test boundary, so 26.3% of the test set was already in
+    # training and the score measured memory. Grouping keeps twins one side.
+    groups = X_processed[AG_FEATURES].astype(str).agg("|".join, axis=1)
+    splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    train_idx, test_idx = next(splitter.split(X_processed, y, groups=groups))
+    X_train, X_test = X_processed.iloc[train_idx], X_processed.iloc[test_idx]
+    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
     
     # 3. Train XGBoost
     print("Training XGBoost Baseline...")

@@ -20,7 +20,6 @@ import numpy as np
 import pandas as pd
 from autogluon.tabular import TabularPredictor
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from feature_utils import engineer_features, AG_FEATURES
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -29,7 +28,7 @@ AUTO_YES_THRESHOLD = 0.97
 
 def load_claims(path, limit=None):
     df = pd.read_csv(path, engine="python", on_bad_lines="skip", encoding="utf-8-sig")
-    df.columns = df.columns.astype(str).str.strip().str.replace("﻿", "")
+    df.columns = df.columns.astype(str).str.strip()
     return df.head(limit) if limit else df
 
 

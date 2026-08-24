@@ -20,7 +20,7 @@ def run_inference(
 ):
     print(f"Loading data from {data_path}...")
     df = pd.read_csv(data_path, engine='python', on_bad_lines='skip', encoding='utf-8-sig')
-    df.columns = df.columns.astype(str).str.strip().str.replace('\ufeff', '')
+    df.columns = df.columns.astype(str).str.strip()
     
     verdict_col = 'Ver-dict' if 'Ver-dict' in df.columns else [c for c in df.columns if 'verdict' in c.lower()][0]
     df.rename(columns={verdict_col: 'Actual_Verdict'}, inplace=True)
