@@ -28,7 +28,6 @@ Or export required envs:
 
 ```shell
 YT_API_KEY=AIza...                # Grab free from GCP console - 1 unit per 50 videos capped at 10k units/day.
-OPENAI_API_KEY=sk-proj-...
 ```
 
 ## CLI 

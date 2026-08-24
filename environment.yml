@@ -11,7 +11,6 @@ dependencies:
   - google-api-python-client
   - pandas
   - numpy
-  - openai
   - tqdm
   - python-dotenv
   - flask

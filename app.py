@@ -1,6 +1,6 @@
 # Keep env loading first, Gunicorn/Flask import app.py as a module
 from helpers import load_env
-load_env(["YT_API_KEY", "OPENAI_API_KEY"])
+load_env(["YT_API_KEY"])
 
 
 from flask import Flask, request, jsonify, send_file

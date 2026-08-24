@@ -6,7 +6,6 @@ data/
 *.csv
 !Licensed.csv
 !assets_single_media_component.csv
-!no_codes - Sheet1.csv
 
 .env*
 !.env.example
