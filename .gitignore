@@ -17,3 +17,6 @@ trey_pipeline/models/ag_challenger_deploy/
 
 # Model artifact is served from GCS (scripts/fetch_model.sh), not git.
 trey_pipeline/models/ag_challenger/
+
+# Experiment outputs from run_experiment.sh -- models are reproducible, reports copied out as needed.
+trey_pipeline/models/experiments/

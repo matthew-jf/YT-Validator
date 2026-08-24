@@ -10,6 +10,7 @@ Scores the claims, applies the model-driven decision rules, then joins on
 video_id and reports how automated decisions compares to Ben's.
 """
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -22,7 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from feature_utils import engineer_features, AG_FEATURES
 
-MODEL_DIR = PROJECT_ROOT / "models"
+MODEL_DIR = Path(os.environ.get("MODEL_DIR", PROJECT_ROOT / "models"))
 AUTO_YES = 0.97
 REVIEW = json.load(open(MODEL_DIR / "ag_threshold.json"))["threshold"]
 
