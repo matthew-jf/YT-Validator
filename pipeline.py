@@ -23,12 +23,15 @@ BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / 'model.joblib'
 LICENSED_PATH = BASE_DIR / 'Licensed.csv'
 ASSET_MEDIA_PATH = BASE_DIR / 'assets_single_media_component.csv'
+LANG_SHEET_PATH = BASE_DIR / 'sheets_language_families.csv'
+LID_MODEL_PATH = BASE_DIR / 'lid.176.ftz'
 
 RANDOM_STATE = 42
 TRAIN_START = pandas.Timestamp('2022-01-01')  # recency window that validated best
 HOLDOUT_DAYS = 150          # most recent labeled claims, used to tune thresholds
 BUCKET_TARGET = 0.95        # per-bucket accuracy target for triage cutoffs
 MIN_BUCKET_N = 50
+LANG_MIN_PROB = 0.30        # blank predicted_lang below this lid confidence
 
 # Claims with these no_codes are excluded from training: their verdicts are
 # rule-driven (licensed asset, video unavailable, ...) and are reproduced by
@@ -236,6 +239,126 @@ def check_videos_available_batch(video_ids, youtube_client, check_stopped=None):
 
 
 # ---------------------------------------------------------------------------
+# Title language detection (offline fastText lid.176; no API key or network)
+# ---------------------------------------------------------------------------
+# lid.176 labels are mostly ISO 639-1; translate those to the ISO 639-3 codes
+# used by the WESS sheet. Labels not in this dict (ceb, war, arz, ...) are
+# already 639-3-compatible and pass through unchanged.
+FASTTEXT_TO_ISO3 = {
+    'af': 'afr', 'am': 'amh', 'an': 'arg', 'ar': 'ara', 'as': 'asm',
+    'av': 'ava', 'az': 'aze', 'ba': 'bak', 'be': 'bel', 'bg': 'bul',
+    'bn': 'ben', 'bo': 'bod', 'br': 'bre', 'bs': 'bos', 'ca': 'cat',
+    'ce': 'che', 'co': 'cos', 'cs': 'ces', 'cv': 'chv', 'cy': 'cym',
+    'da': 'dan', 'de': 'deu', 'dv': 'div', 'el': 'ell', 'en': 'eng',
+    'eo': 'epo', 'es': 'spa', 'et': 'est', 'eu': 'eus', 'fa': 'fas',
+    'fi': 'fin', 'fr': 'fra', 'fy': 'fry', 'ga': 'gle', 'gd': 'gla',
+    'gl': 'glg', 'gn': 'grn', 'gu': 'guj', 'gv': 'glv', 'he': 'heb',
+    'hi': 'hin', 'hr': 'hrv', 'ht': 'hat', 'hu': 'hun', 'hy': 'hye',
+    'ia': 'ina', 'id': 'ind', 'ie': 'ile', 'io': 'ido', 'is': 'isl',
+    'it': 'ita', 'ja': 'jpn', 'jv': 'jav', 'ka': 'kat', 'kk': 'kaz',
+    'km': 'khm', 'kn': 'kan', 'ko': 'kor', 'ku': 'kur', 'kv': 'kom',
+    'kw': 'cor', 'ky': 'kir', 'la': 'lat', 'lb': 'ltz', 'li': 'lim',
+    'lo': 'lao', 'lt': 'lit', 'lv': 'lav', 'mg': 'mlg', 'mk': 'mkd',
+    'ml': 'mal', 'mn': 'mon', 'mr': 'mar', 'ms': 'msa', 'mt': 'mlt',
+    'my': 'mya', 'ne': 'nep', 'nl': 'nld', 'nn': 'nno', 'no': 'nor',
+    'oc': 'oci', 'or': 'ori', 'os': 'oss', 'pa': 'pan', 'pl': 'pol',
+    'ps': 'pus', 'pt': 'por', 'qu': 'que', 'rm': 'roh', 'ro': 'ron',
+    'ru': 'rus', 'sa': 'san', 'sc': 'srd', 'sd': 'snd', 'sh': 'hbs',
+    'si': 'sin', 'sk': 'slk', 'sl': 'slv', 'so': 'som', 'sq': 'sqi',
+    'sr': 'srp', 'su': 'sun', 'sv': 'swe', 'sw': 'swa', 'ta': 'tam',
+    'te': 'tel', 'tg': 'tgk', 'th': 'tha', 'tk': 'tuk', 'tl': 'tgl',
+    'tr': 'tur', 'tt': 'tat', 'ug': 'uig', 'uk': 'ukr', 'ur': 'urd',
+    'uz': 'uzb', 'vi': 'vie', 'vo': 'vol', 'wa': 'wln', 'yi': 'yid',
+    'yo': 'yor', 'zh': 'zho',
+    'als': 'gsw',  # fastText 'als' is Alemannic, not ISO 639-3 Tosk Albanian
+    'bh': 'bih',   # Bihari collective
+}
+
+# Individual language -> ISO 639-3 macrolanguage, so a WESS individual code
+# (e.g. zlm) matches a detection lid can only make at macro level (ms -> msa).
+# Members limited to codes present in the WESS sheet or the lid label set.
+# Serbo-Croatian is deliberately not collapsed: lid distinguishes sr/hr/bs.
+MACRO_OF = {
+    # Malay (lid: ms, id, min)
+    'zlm': 'msa', 'zsm': 'msa', 'ind': 'msa', 'min': 'msa', 'bjn': 'msa',
+    'jax': 'msa', 'kvr': 'msa', 'liw': 'msa', 'max': 'msa', 'mfa': 'msa',
+    'mfb': 'msa', 'mqg': 'msa', 'mui': 'msa', 'pse': 'msa', 'vkt': 'msa',
+    'xmm': 'msa',
+    # Arabic (lid: ar, arz)
+    'arb': 'ara', 'arz': 'ara', 'acm': 'ara', 'acq': 'ara', 'aeb': 'ara',
+    'aec': 'ara', 'afb': 'ara', 'ajp': 'ara', 'apd': 'ara', 'arq': 'ara',
+    'ary': 'ara', 'avl': 'ara', 'ayl': 'ara', 'shu': 'ara',
+    # Chinese (lid: zh, yue, wuu)
+    'cmn': 'zho', 'yue': 'zho', 'wuu': 'zho', 'nan': 'zho', 'hak': 'zho',
+    'cdo': 'zho', 'hsn': 'zho',
+    'pes': 'fas', 'prs': 'fas',              # Persian (lid: fa)
+    'swh': 'swa', 'swc': 'swa',              # Swahili (lid: sw)
+    'azj': 'aze', 'azb': 'aze',              # Azerbaijani (lid: az, azb)
+    'uzn': 'uzb', 'uzs': 'uzb',              # Uzbek (lid: uz)
+    'npi': 'nep', 'dty': 'nep',              # Nepali (lid: ne, dty)
+    'ory': 'ori', 'spv': 'ori',              # Odia (lid: or)
+    'kmr': 'kur', 'ckb': 'kur', 'sdh': 'kur',  # Kurdish (lid: ku, ckb)
+    'khk': 'mon', 'mvf': 'mon',              # Mongolian (lid: mn)
+    'gaz': 'orm', 'hae': 'orm', 'gax': 'orm',  # Oromo
+    'gug': 'grn', 'gui': 'grn', 'gun': 'grn', 'gnw': 'grn',  # Guarani (lid: gn)
+    'ayr': 'aym',                            # Aymara
+    'pbt': 'pus', 'pbu': 'pus',              # Pashto (lid: ps)
+    'pnb': 'lah', 'skr': 'lah', 'hnd': 'lah', 'hno': 'lah',  # Lahnda (lid: pnb)
+    'nob': 'nor', 'nno': 'nor',              # Norwegian (lid: no, nn)
+    'ekk': 'est',                            # Estonian (lid: et)
+    'lvs': 'lav',                            # Latvian (lid: lv)
+    'src': 'srd',                            # Sardinian (lid: sc)
+    'als': 'sqi', 'aln': 'sqi',              # Albanian (lid: sq)
+    'gom': 'kok', 'knn': 'kok',              # Konkani (lid: gom)
+    'ydd': 'yid',                            # Yiddish (lid: yi)
+    # Malagasy (lid: mg)
+    'bhr': 'mlg', 'msh': 'mlg', 'plt': 'mlg', 'skg': 'mlg', 'tdx': 'mlg',
+    'txy': 'mlg', 'xmv': 'mlg', 'xmw': 'mlg',
+    # Quechua (lid: qu)
+    'qub': 'que', 'quf': 'que', 'qug': 'que', 'quh': 'que', 'qul': 'que',
+    'qup': 'que', 'quy': 'que', 'quz': 'que', 'qva': 'que', 'qve': 'que',
+    'qvh': 'que', 'qvi': 'que', 'qvm': 'que', 'qvn': 'que', 'qvs': 'que',
+    'qvw': 'que', 'qwh': 'que', 'qxh': 'que', 'qxn': 'que', 'qxo': 'que',
+    'qxq': 'que', 'qxr': 'que',
+    # Zhuang
+    'zch': 'zha', 'zhn': 'zha', 'zyb': 'zha', 'zyj': 'zha',
+}
+
+
+def normalize_fasttext_label(label):
+    """'__label__en' -> 'eng'; 3-letter lid labels pass through."""
+    code = label.replace('__label__', '').lower()
+    return FASTTEXT_TO_ISO3.get(code, code)
+
+
+def get_lid_model():
+    import fasttext  # provided by fasttext-predict (prediction-only wheels)
+    return fasttext.load_model(str(LID_MODEL_PATH))
+
+
+def detect_languages_batch(titles, check_stopped=None):
+    """
+    Detect the language of each title with the bundled fastText lid.176 model.
+    Labels are normalized to ISO 639-3; predictions below LANG_MIN_PROB map
+    to '' (undetermined). Returns dict mapping title -> language code.
+    """
+    from tqdm import tqdm
+
+    model = get_lid_model()
+    results = {}
+    msg = 'Detecting title languages'
+    for i, title in enumerate(tqdm(titles, desc=msg)):
+        if check_stopped and i % 1000 == 0:
+            check_stopped(msg)
+        labels, probs = model.predict(title.replace('\n', ' '), k=1)
+        if labels and probs[0] >= LANG_MIN_PROB:
+            results[title] = normalize_fasttext_label(labels[0])
+        else:
+            results[title] = ''
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 def main(args, status_callback=None, stop_check=None):
@@ -275,6 +398,13 @@ def main(args, status_callback=None, stop_check=None):
     asset_to_media_component = dict(zip(assets_media_df['asset_id'],
                                         assets_media_df['media_component_id']))
 
+    # WESS language number -> ISO 639-3 (rows with blank ISO codes dropped)
+    lang_df = pandas.read_csv(LANG_SHEET_PATH)
+    iso = lang_df['ISO_lang'].fillna('').astype(str).str.strip().str.lower()
+    nums = pandas.to_numeric(lang_df['WESS_LAN_num'], errors='coerce')
+    wess_to_iso = {int(n): c for n, c in zip(nums, iso)
+                   if pandas.notna(n) and len(c) == 3}
+
     # -----------------------------------------------------------------------
     # Process unprocessed claims
     # -----------------------------------------------------------------------
@@ -305,6 +435,40 @@ def main(args, status_callback=None, stop_check=None):
         df['video_available'] = df['video_id'].map(available_map)
     else:
         df['video_available'] = True  # Default to True if no video_id column
+
+    # predicted_lang: ISO 639-3 of video_title via bundled fastText lid.176
+    # ('' = empty title or below-confidence detection). A pre-existing
+    # predicted_lang column in the input is reused without re-detecting.
+    if 'predicted_lang' in df.columns:
+        df['predicted_lang'] = df['predicted_lang'].fillna('').astype(str)
+    elif 'video_title' in df.columns:
+        msg = 'Detecting title languages'
+        check_stopped(msg)
+        if status_callback:
+            status_callback(msg)
+        stripped = df['video_title'].fillna('').astype(str).str.strip()
+        unique_titles = [t for t in stripped.unique() if t]
+        lang_map = detect_languages_batch(unique_titles,
+                                          check_stopped=check_stopped)
+        df['predicted_lang'] = stripped.map(lang_map).fillna('')
+    else:
+        df['predicted_lang'] = ''
+
+    # expected_lang: claim's WESS language_id mapped to ISO 639-3 via
+    # sheets_language_families.csv ('' when blank or unmapped).
+    if 'language_id' in df.columns:
+        wess_num = pandas.to_numeric(df['language_id'],
+                                     errors='coerce').astype('Int64')
+        df['expected_lang'] = wess_num.map(wess_to_iso).fillna('')
+    else:
+        df['expected_lang'] = ''
+
+    # lang_match: Y/N with macrolanguage-aware equality (zlm vs ms -> Y),
+    # '' when either side is undetermined.
+    pred = df['predicted_lang'].map(lambda c: MACRO_OF.get(c, c))
+    exp = df['expected_lang'].map(lambda c: MACRO_OF.get(c, c))
+    df['lang_match'] = np.where((pred == '') | (exp == ''), '',
+                                np.where(pred == exp, 'Y', 'N'))
 
     check_stopped('before predictions')
     if status_callback:

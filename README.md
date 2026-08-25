@@ -10,6 +10,10 @@ conda env create -f environment.yml
 conda activate YT-Validator
 ```
 
+(`environment.yml` also pip-installs `fasttext-predict`, used for offline
+title language detection; `conda env update -f environment.yml --prune`
+picks it up on existing envs.)
+
 On servers where systemd runs the service as `root`, update the env as root so changes land in the right place:
 
 ```shell
@@ -58,10 +62,16 @@ eg. `--training-data /Users/matthew.jurewicz/Downloads/export_all_claims_2025072
 
 If the input CSV already has a `video_available` column it is reused and the
 YouTube API is not called (no `YT_API_KEY` needed for such offline runs).
+Likewise a pre-existing `predicted_lang` column is reused (drop it from the
+input to force re-detection). Language detection itself is fully offline —
+the fastText `lid.176.ftz` model is bundled in the repo, no key needed.
 
 Output CSV = input columns plus:
 
 - `licensed`, `media_component_id`, `video_available` — enrichment (as before)
+- `predicted_lang` — ISO 639-3 language of `video_title` via bundled fastText lid.176 (`''` if the title is empty or detection confidence < 0.30)
+- `expected_lang` — the claim's `language_id` (WESS number) mapped through `sheets_language_families.csv` (`''` if blank or unmapped)
+- `lang_match` — `Y`/`N` comparing the two at macrolanguage granularity (e.g. expected `zlm` vs detected `ms` → `Y`), `''` when either side is empty
 - `rating` — model probability of verdict Y, forced to 0 for licensed assets and unavailable videos (as before)
 - `predicted_verdict` — Y/N at the tuned threshold, after the licensed/unavailable rules
 - `confidence` — max(p, 1-p) of the raw model probability

@@ -13,3 +13,6 @@ dependencies:
   - tqdm
   - python-dotenv
   - flask
+  - pip
+  - pip:
+      - fasttext-predict
