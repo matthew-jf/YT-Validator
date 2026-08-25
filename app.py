@@ -19,6 +19,20 @@ app = Flask(__name__)
 tasks = TaskStore()
 GIT_BRANCH, GIT_COMMIT = get_git_info()
 
+# One scoring run saturates the available cores, so runs are serialised.
+# Concurrent runs would only contend for CPU while multiplying peak memory.
+INFERENCE_SLOT = threading.Semaphore(1)
+
+# Warm the model at import (Gunicorn imports this module), so a corrupt artifact
+# fails the service at startup rather than inside a background task. A missing
+# artifact is a valid state -- /predict can still be called with training_data.
+from pipeline import model_info, warm_model
+
+try:
+    print(f"Model warm in {warm_model():.2f}s")
+except FileNotFoundError:
+    print("No model artifact yet -- /predict needs training_data to build one")
+
 
 @app.route('/health')
 def health_check():
@@ -28,6 +42,8 @@ def health_check():
         'version': '1.0.0',
         'branch': GIT_BRANCH,
         'commit': GIT_COMMIT,
+        'model': model_info(),
+        'running_tasks': sum(1 for t in tasks.values() if t.get('status') == 'running'),
         'timestamp': time.time()
     })
 
@@ -140,7 +156,8 @@ def run_prediction(task_id, args):
     try:
         
         from pipeline import main
-        main(args, status_callback=update_status, stop_check=should_stop)
+        with INFERENCE_SLOT:                      # one scoring run at a time
+            main(args, status_callback=update_status, stop_check=should_stop)
 
         if should_stop():
             tasks[task_id]['status'] = 'stopped'

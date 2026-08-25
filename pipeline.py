@@ -1,5 +1,8 @@
 import argparse
 import os
+import sys
+import threading
+import time
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +32,83 @@ TRAIN_START = pandas.Timestamp('2022-01-01')  # recency window that validated be
 HOLDOUT_DAYS = 150          # most recent labeled claims, used to tune thresholds
 BUCKET_TARGET = 0.95        # per-bucket accuracy target for triage cutoffs
 MIN_BUCKET_N = 50
+
+# The artifact is deserialised once per process rather than once per request, and
+# app.py warms it at startup so a corrupt model fails the service immediately
+# instead of surfacing inside a background task.
+_ARTIFACT = None
+_MODEL_LOAD_SECONDS = None
+_WARM_SECONDS = None
+_LOAD_LOCK = threading.Lock()
+
+# One row exercising every raw column build_features() reads, so warming runs the
+# real encode + predict path rather than just touching the file.
+_WARM_PROBE = {
+    'views': 1, 'matching_duration': 60.0, 'longest_match': 60.0,
+    'video_duration_sec': 60.0, 'video_title': 'warmup',
+    'claim_created_date': '2026-01-02', 'video_upload_date': '2026-01-01',
+    'claim_type': 'AUDIOVISUAL', 'claim_origin': 'UGC', 'content_type': 'VIDEO_MATCH',
+    'claim_report_source': 'warmup', 'asset_labels': 'warmup',
+    'asset_id': 'warmup', 'custom_id': 'warmup',
+    'reference_id': 'warmup', 'channel_id': 'warmup',
+}
+
+
+def peak_rss_mb():
+    """Process high-water memory mark, in MB. ru_maxrss is bytes on macOS, KB on Linux."""
+    try:
+        import resource
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return round(peak / (1048576 if sys.platform == 'darwin' else 1024), 1)
+    except Exception:
+        return None
+
+
+def get_artifact():
+    """Return the model artifact, deserialising it once per process."""
+    global _ARTIFACT, _MODEL_LOAD_SECONDS
+    if _ARTIFACT is None:
+        with _LOAD_LOCK:
+            if _ARTIFACT is None:  # another thread may have won the race
+                started = time.time()
+                artifact = joblib.load(MODEL_PATH)
+                _MODEL_LOAD_SECONDS = time.time() - started
+                _ARTIFACT = artifact
+    return _ARTIFACT
+
+
+def warm_model():
+    """Load the artifact and score one row, so a corrupt model fails loudly here.
+
+    Raises FileNotFoundError when no artifact exists yet -- that is a valid
+    state, since /predict can still be called with training_data to build one.
+    """
+    global _WARM_SECONDS
+    artifact = get_artifact()
+    started = time.time()
+    artifact['model'].predict_proba(build_features(pandas.DataFrame([_WARM_PROBE]))[FEATURES])
+    _WARM_SECONDS = time.time() - started
+    return _WARM_SECONDS
+
+
+def model_info():
+    """Describe the loaded model, for /health and deploy verification."""
+    meta = (_ARTIFACT or {}).get('metadata', {})
+    return {
+        'model_path': str(MODEL_PATH),
+        'loaded': _ARTIFACT is not None,
+        'warm': _WARM_SECONDS is not None,
+        'threshold': (_ARTIFACT or {}).get('threshold'),
+        't_low': (_ARTIFACT or {}).get('t_low'),
+        't_high': (_ARTIFACT or {}).get('t_high'),
+        'trained_at': meta.get('trained_at'),
+        'train_rows': meta.get('train_rows'),
+        'holdout_auc': meta.get('holdout_auc'),
+        'load_seconds': round(_MODEL_LOAD_SECONDS, 2) if _MODEL_LOAD_SECONDS else None,
+        'warm_seconds': round(_WARM_SECONDS, 2) if _WARM_SECONDS else None,
+        'peak_rss_mb': peak_rss_mb(),
+    }
+
 
 # Claims with these no_codes are excluded from training: their verdicts are
 # rule-driven (licensed asset, video unavailable, ...) and are reproduced by
@@ -189,6 +269,8 @@ def train_model(training_data, status_callback=None, check_stopped=None):
         },
     }
     joblib.dump(artifact, MODEL_PATH)
+    global _ARTIFACT
+    _ARTIFACT = artifact          # a retrain replaces what the process serves
     status(f'Saved model artifact to {MODEL_PATH}')
     return artifact
 
@@ -253,7 +335,7 @@ def main(args, status_callback=None, stop_check=None):
     if MODEL_PATH.exists():
         if status_callback:
             status_callback(f'Loading cached model from {MODEL_PATH}')
-        artifact = joblib.load(MODEL_PATH)
+        artifact = get_artifact()
     else:
         if not args.training_data:
             raise ValueError(f'Training data is required to create {MODEL_PATH}')

@@ -3,22 +3,21 @@ FROM continuumio/miniconda3:latest
 WORKDIR /app
 
 # Copy environment file and create conda env
-COPY environment-no-builds.yml .
-RUN conda env create -f environment-no-builds.yml
+COPY environment.yml .
+RUN conda env create -f environment.yml
 
 # Activate environment and ensure it's used
 SHELL ["conda", "run", "-n", "YT-Validator", "/bin/bash", "-c"]
 
-# Copy application files
-COPY app.py pipeline.py ./
-COPY data ./data/
+# Application code, plus the artifacts pipeline.py resolves next to itself
+COPY app.py pipeline.py helpers.py ./
+COPY model.joblib Licensed.csv assets_single_media_component.csv ./
 
-# Create data directory for runtime
+# Runtime scratch: uploads, outputs and the task store live here
 RUN mkdir -p /app/data
 
-# Set environment variables
 ENV FLASK_RUN_HOST=0.0.0.0
 ENV FLASK_DEBUG=0
+EXPOSE 3001
 
-# Cloud Run requires the app to listen on $PORT
-CMD ["conda", "run", "-n", "YT-Validator", "python", "app.py"]
+CMD ["conda", "run", "--no-capture-output", "-n", "YT-Validator", "python", "app.py"]
