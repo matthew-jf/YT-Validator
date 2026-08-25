@@ -236,6 +236,55 @@ def check_videos_available_batch(video_ids, youtube_client, check_stopped=None):
 
 
 # ---------------------------------------------------------------------------
+# Title language detection (lazy key so runs without it just skip the column)
+# ---------------------------------------------------------------------------
+def get_google_api_key():
+    load_env()
+    return os.environ.get('GOOGLE_API_KEY')
+
+
+def detect_languages_batch(titles, api_key, check_stopped=None):
+    """
+    Detect the language of each title via Google Translation v2 detect,
+    in batches of 128 (API limit), retrying with backoff on errors.
+    Chunks that still fail map to '' (empty string).
+    Returns dict mapping title -> language code.
+    """
+    import time
+
+    import requests
+    from tqdm import tqdm
+
+    url = 'https://translation.googleapis.com/language/translate/v2/detect'
+    results = {}
+    batch_size = 128
+    max_retries = 3
+    msg = 'Detecting title languages'
+
+    for i in tqdm(range(0, len(titles), batch_size), desc=msg):
+        if check_stopped:
+            check_stopped(msg)
+        batch = titles[i:i + batch_size]
+
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(url, params={'key': api_key},
+                                         json={'q': batch}, timeout=30)
+                response.raise_for_status()
+                detections = response.json()['data']['detections']
+                for title, detection in zip(batch, detections):
+                    results[title] = detection[0]['language'] if detection else ''
+                break
+            except Exception:
+                time.sleep(2 ** attempt)
+        else:
+            for title in batch:
+                results[title] = ''
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 def main(args, status_callback=None, stop_check=None):
@@ -305,6 +354,31 @@ def main(args, status_callback=None, stop_check=None):
         df['video_available'] = df['video_id'].map(available_map)
     else:
         df['video_available'] = True  # Default to True if no video_id column
+
+    # Add predicted_lang column (language code of video_title via Google
+    # Translation detect; '' = not attempted/failed, 'und' = undetermined).
+    # If the input already carries a predicted_lang column, it is reused and
+    # the Translation API is not called. Missing GOOGLE_API_KEY skips detection.
+    if 'predicted_lang' in df.columns:
+        df['predicted_lang'] = df['predicted_lang'].fillna('').astype(str)
+    elif 'video_title' in df.columns:
+        api_key = get_google_api_key()
+        if api_key:
+            msg = 'Detecting title languages'
+            check_stopped(msg)
+            if status_callback:
+                status_callback(msg)
+            stripped = df['video_title'].fillna('').astype(str).str.strip()
+            unique_titles = [t for t in stripped.unique() if t]
+            lang_map = detect_languages_batch(unique_titles, api_key,
+                                              check_stopped=check_stopped)
+            df['predicted_lang'] = stripped.map(lang_map).fillna('')
+        else:
+            if status_callback:
+                status_callback('GOOGLE_API_KEY not set; skipping language detection')
+            df['predicted_lang'] = ''
+    else:
+        df['predicted_lang'] = ''
 
     check_stopped('before predictions')
     if status_callback:

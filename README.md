@@ -41,6 +41,7 @@ Or export required envs:
 
 ```shell
 YT_API_KEY=AIza...                # Grab free from GCP console - 1 unit per 50 videos capped at 10k units/day.
+GOOGLE_API_KEY=AIza...            # GCP key with Cloud Translation API enabled - billed per character of title text. Optional: only needed for predicted_lang.
 ```
 
 ## CLI 
@@ -58,10 +59,13 @@ eg. `--training-data /Users/matthew.jurewicz/Downloads/export_all_claims_2025072
 
 If the input CSV already has a `video_available` column it is reused and the
 YouTube API is not called (no `YT_API_KEY` needed for such offline runs).
+Likewise a pre-existing `predicted_lang` column is reused and the Translation
+API is not called (drop the column from the input to force re-detection).
 
 Output CSV = input columns plus:
 
 - `licensed`, `media_component_id`, `video_available` — enrichment (as before)
+- `predicted_lang` — language code of `video_title` via Google Translation detect (`''` if skipped or the title is empty, `und` if the API can't determine it)
 - `rating` — model probability of verdict Y, forced to 0 for licensed assets and unavailable videos (as before)
 - `predicted_verdict` — Y/N at the tuned threshold, after the licensed/unavailable rules
 - `confidence` — max(p, 1-p) of the raw model probability

@@ -13,3 +13,4 @@ dependencies:
   - tqdm
   - python-dotenv
   - flask
+  - requests
