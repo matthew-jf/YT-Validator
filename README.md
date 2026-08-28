@@ -71,7 +71,8 @@ Output CSV = input columns plus:
 - `licensed`, `media_component_id`, `video_available` — enrichment (as before)
 - `predicted_lang` — ISO 639-3 language of `video_title` via bundled fastText lid.176 (`''` if the title is empty or detection confidence < 0.30)
 - `expected_lang` — the claim's `language_id` (WESS number) mapped through `sheets_language_families.csv` (`''` if blank or unmapped)
-- `lang_match` — `Y`/`N` comparing the two at macrolanguage granularity (e.g. expected `zlm` vs detected `ms` → `Y`), `''` when either side is empty
+- `lang_match` — `Y`/`N` comparing the two at macrolanguage granularity (e.g. expected `zlm` vs detected `ms` → `Y`), `''` when either side is empty; also `Y` when the title names the expected language even if detection disagrees
+- `title_names_lang` — `Y`/`N`: whether `video_title` contains a distinctive word of the expected language's anglicized name(s) from the sheet (e.g. "JESUS Film - **Amharic**" detects as `eng` but names `amh`); `''` when the title is empty or the language has no usable name tokens
 - `rating` — model probability of verdict Y, forced to 0 for licensed assets and unavailable videos (as before)
 - `predicted_verdict` — Y/N at the tuned threshold, after the licensed/unavailable rules
 - `confidence` — max(p, 1-p) of the raw model probability

@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import sys
 import threading
 import time
@@ -413,6 +414,44 @@ def normalize_fasttext_label(label):
     return FASTTEXT_TO_ISO3.get(code, code)
 
 
+# Generic modifiers and ambiguous English words that would cause false name
+# matches ("Ave Maria", "Black ..."); tokens < 4 chars are dropped by rule,
+# except distinctive short language names in NAME_SHORT_OK.
+NAME_STOP_TOKENS = frozenset({
+    'wider', 'central', 'south', 'north', 'east', 'west',
+    'southern', 'northern', 'eastern', 'western',
+    'northeast', 'northwest', 'southeast', 'southwest',
+    'upper', 'lower', 'inner', 'outer',
+    'global', 'formal', 'general', 'standard', 'modern', 'classical',
+    'vehicular', 'emigre', 'language',
+    'black', 'maria', 'male', 'mango', 'bench',
+})
+NAME_SHORT_OK = frozenset({'twi', 'ewe', 'fon', 'lao', 'edo', 'tiv', 'vai'})
+
+
+def build_lang_name_patterns(lang_df):
+    """
+    Macro ISO 639-3 -> compiled regex matching any distinctive token of the
+    group's anglicized names ('Castilian Spanish' -> castilian|spanish), so a
+    title that NAMES its expected language ('JESUS Film - Amharic') can be
+    recognized even though it detects as eng.
+    """
+    tokens = {}
+    iso = lang_df['ISO_lang'].fillna('').astype(str).str.strip().str.lower()
+    names = lang_df['Anglicized_name'].fillna('').astype(str)
+    for code, name in zip(iso, names):
+        if len(code) != 3:
+            continue
+        macro = MACRO_OF.get(code, code)
+        for tok in re.split(r'[,\s]+', name.strip().lower()):
+            if tok in NAME_STOP_TOKENS:
+                continue
+            if len(tok) >= 4 or tok in NAME_SHORT_OK:
+                tokens.setdefault(macro, set()).add(re.escape(tok))
+    return {m: re.compile(r'\b(?:%s)\b' % '|'.join(sorted(t)), re.IGNORECASE)
+            for m, t in tokens.items()}
+
+
 def get_lid_model():
     import fasttext  # provided by fasttext-predict (prediction-only wheels)
     return fasttext.load_model(str(LID_MODEL_PATH))
@@ -486,6 +525,7 @@ def main(args, status_callback=None, stop_check=None):
     nums = pandas.to_numeric(lang_df['WESS_LAN_num'], errors='coerce')
     wess_to_iso = {int(n): c for n, c in zip(nums, iso)
                    if pandas.notna(n) and len(c) == 3}
+    lang_name_pats = build_lang_name_patterns(lang_df)
 
     # -----------------------------------------------------------------------
     # Process unprocessed claims
@@ -546,11 +586,24 @@ def main(args, status_callback=None, stop_check=None):
         df['expected_lang'] = ''
 
     # lang_match: Y/N with macrolanguage-aware equality (zlm vs ms -> Y),
-    # '' when either side is undetermined.
+    # '' when either side is undetermined. Titles that NAME the expected
+    # language ('JESUS Film - Amharic' detects as eng) are not mismatches:
+    # title_names_lang records the name hit and upgrades N -> Y.
     pred = df['predicted_lang'].map(lambda c: MACRO_OF.get(c, c))
     exp = df['expected_lang'].map(lambda c: MACRO_OF.get(c, c))
-    df['lang_match'] = np.where((pred == '') | (exp == ''), '',
-                                np.where(pred == exp, 'Y', 'N'))
+    titles = (df['video_title'].fillna('').astype(str)
+              if 'video_title' in df.columns
+              else pandas.Series('', index=df.index))
+    named = pandas.Series(False, index=df.index)
+    for code, sub in titles.groupby(exp):
+        if code in lang_name_pats:
+            named.loc[sub.index] = sub.str.contains(lang_name_pats[code])
+    df['title_names_lang'] = np.where(
+        (titles == '') | ~exp.isin(list(lang_name_pats)), '',
+        np.where(named, 'Y', 'N'))
+    df['lang_match'] = np.select(
+        [(pred == '') | (exp == ''), pred == exp, named],
+        ['', 'Y', 'Y'], 'N')
 
     check_stopped('before predictions')
     if status_callback:
