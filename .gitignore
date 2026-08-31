@@ -1,11 +1,17 @@
 .DS_Store
 .cache/
+.venv/
 .vscode/
 __pycache__/
 data/
 *.csv
 !Licensed.csv
 !assets_single_media_component.csv
+
+# WESS language predictor artifacts (delete to retrain; see README)
+wess_artifact.json
+wess_fasttext.ftz
+lid.176.ftz
 
 .env*
 !.env.example
