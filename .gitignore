@@ -9,10 +9,5 @@ data/
 !assets_single_media_component.csv
 !sheets_language_families.csv
 
-# WESS language predictor artifacts (delete to retrain; see README)
-wess_artifact.json
-wess_fasttext.ftz
-lid.176.ftz
-
 .env*
 !.env.example
