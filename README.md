@@ -68,6 +68,59 @@ Output CSV = input columns plus:
 - `triage` — `AUTO_N_LICENSED` / `AUTO_N_UNAVAILABLE` / `AUTO_N` / `AUTO_Y` (auto-decidable at >= 95% holdout accuracy) or `REVIEW` (route to manual review)
 
 
+## WESS language prediction
+
+`predict_wess.py` predicts the WESS `language_id` (the number entered in the
+monthly sheet, `WESS_LAN_num` in `sheets_language_families.csv`) for
+unprocessed claims. Precision-first cascade — a tier only fires when its
+cutoff, calibrated to >= 95% precision, is met; everything else is `REVIEW`:
+
+1. `CHANNEL` — the channel's labeled history is unanimous (min claim count is tuned)
+2. `TITLE` — the title contains a validated language-name rule (Anglicized
+   names from the sheets mapping plus native-name aliases mined from history,
+   e.g. "bahasa melayu jambi")
+3. `FASTTEXT` — supervised fastText classifier over channel-prior tokens
+   (channel's top historical languages, leave-one-out at fit time) + title text
+4. `LID` — pretrained lid.176 language ID on the title, ISO -> WESS via the
+   sheets mapping, ambiguous codes resolved by history frequency
+
+Train (builds `wess_artifact.json` + `wess_fasttext.ftz`; delete both to
+retrain) and evaluate against a completed monthly sheet:
+
+```shell
+python predict_wess.py \
+  --prediction-input unprocessed_claims.csv \
+  --history all_claims.csv \
+  --eval-labels "Unprocessed_ClaimsMCN_Matt_JULY(1).csv"
+```
+
+When `--eval-labels` is present at training time, per-tier cutoffs are
+calibrated on a stable half of that reviewed batch (rows whose video_id also
+appears in history are excluded from training) and scored on the other half —
+same recalibration philosophy as the verdict model's triage cutoffs. July 2026
+batch, held-out half: `CHANNEL` 24/24 = 100%, `FASTTEXT` 124/128 = 96.9%,
+total 97.4% accuracy at 28.3% coverage of language-labeled claims. `TITLE` and
+`LID` did not meet the precision bar on that batch and disabled themselves.
+
+Predict-only runs reuse the cached artifacts (~1s for a monthly batch, no
+`--history` needed):
+
+```shell
+python predict_wess.py --prediction-input unprocessed_claims.csv
+```
+
+Output CSV = input columns plus:
+
+- `predicted_language_id` — WESS number, empty when routed to review
+- `predicted_language_name` — Anglicized name from the sheets mapping
+- `language_source` — `CHANNEL` / `TITLE` / `FASTTEXT` / `LID` / `REVIEW`
+- `language_confidence` — 1.0 for exact-rule tiers, model probability otherwise
+
+`lid.176.ftz` is downloaded automatically on first use. fastText comes from
+pip (see `environment.yml`); on macOS, if the source build fails or predict
+raises a numpy-2 copy error, `pip install fasttext-wheel "numpy<2"`.
+
+
 ## API
 
 1. Start server:
