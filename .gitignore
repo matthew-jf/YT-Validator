@@ -1,11 +1,13 @@
 .DS_Store
 .cache/
+.venv/
 .vscode/
 __pycache__/
 data/
 *.csv
 !Licensed.csv
 !assets_single_media_component.csv
+!channel_verdicts.csv
 
 .env*
 !.env.example

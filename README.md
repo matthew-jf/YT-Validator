@@ -36,6 +36,30 @@ shipped `model.joblib` has cutoffs recalibrated on the July 2026 reviewed batch
 recalibrating cutoffs against the most recent reviewed batch by comparing a
 prediction run's raw probabilities to the human verdicts.
 
+## Channel verdict history (AUTO_N_CHANNEL)
+
+`channel_verdicts.csv` (bundled, like `Licensed.csv`) holds each channel whose
+labeled Y/N verdicts are unanimous, with the claim count. It is derived from a
+labeled claims export via `build_channel_verdicts()` and regenerated
+automatically whenever the model is retrained; the raw export itself is not
+committed. Rule-driven verdicts (`no_code` L/V/N/X) are excluded when the
+export carries `no_code`.
+
+At predict time every row gets `channel_history_verdict` /
+`channel_history_claims` for reviewers, and a REVIEW row is upgraded to
+`AUTO_N_CHANNEL` only when all of:
+
+- the channel's history is unanimously N with >= `MIN_CHANNEL_CLAIMS` (3) claims
+- the model also strongly leans N (`rating` <= `CHANNEL_RATING_CAP`, 0.025)
+
+Both constants were calibrated on the July 2026 reviewed batch, where the
+bucket is 95.4% accurate (65 claims, ~2.5% of the REVIEW queue). The gate is
+deliberately strict: unanimous channel history alone was only ~83% accurate
+there, and unanimous-Y history was <70%, so Y never auto-decides. Existing
+buckets are untouched (only REVIEW rows are upgraded). Like the triage
+cutoffs, re-check `MIN_CHANNEL_CLAIMS` / `CHANNEL_RATING_CAP` against the next
+reviewed batch — the operating point sits close to the 95% target.
+
 Configure secrets via `.env` `cp .env.example .env` and edit .env with your keys
 Or export required envs:
 
@@ -65,7 +89,8 @@ Output CSV = input columns plus:
 - `rating` — model probability of verdict Y, forced to 0 for licensed assets and unavailable videos (as before)
 - `predicted_verdict` — Y/N at the tuned threshold, after the licensed/unavailable rules
 - `confidence` — max(p, 1-p) of the raw model probability
-- `triage` — `AUTO_N_LICENSED` / `AUTO_N_UNAVAILABLE` / `AUTO_N` / `AUTO_Y` (auto-decidable at >= 95% holdout accuracy) or `REVIEW` (route to manual review)
+- `channel_history_verdict`, `channel_history_claims` — the channel's unanimous historical verdict and labeled claim count (empty/0 if unseen or mixed)
+- `triage` — `AUTO_N_LICENSED` / `AUTO_N_UNAVAILABLE` / `AUTO_N` / `AUTO_Y` / `AUTO_N_CHANNEL` (auto-decidable at >= 95% reviewed-batch accuracy) or `REVIEW` (route to manual review)
 
 
 ## API
