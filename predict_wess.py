@@ -41,7 +41,10 @@ LID_URL = 'https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz
 PRECISION_TARGET = 0.95   # per-tier precision required on the tuning set
 MIN_BUCKET_N = 25         # a tier must fire at least this often on the tuning set
 VAL_DAYS = 120            # temporal-holdout fallback when no reviewed batch is given
-CASCADE = ['CHANNEL', 'TITLE', 'FASTTEXT', 'LID']
+CASCADE = ['CHANNEL', 'TITLE', 'ASR', 'FASTTEXT', 'LID']
+ASR_MIN_PER_LANG = 25     # tuning rows an ASR language needs before it is judged
+                          # (matches MIN_BUCKET_N: 5/5 passes on luck alone)
+ASR_PRECISION = 0.90      # ...and the precision it must reach to be trusted
 
 # fastText lid.176 labels are mostly ISO 639-1; the sheets mapping uses 639-3.
 # Candidates are tried in order until one exists in the mapping.
@@ -79,6 +82,11 @@ ISO1_TO_3 = {
 # ---------------------------------------------------------------------------
 # Normalization / loading
 # ---------------------------------------------------------------------------
+def normalize_id(value):
+    """Strip the apostrophe Excel adds to ids that begin with '-'."""
+    return str(value).strip().lstrip("'")
+
+
 def norm_lang(value):
     """'6464', 6464.0 -> '6464'; empty / 0 / NaN -> None."""
     if pandas.isna(value):
@@ -332,6 +340,68 @@ def lid_predict(model, label_map, titles):
 # ---------------------------------------------------------------------------
 # Cutoff tuning (most permissive cutoff whose bucket stays >= PRECISION_TARGET)
 # ---------------------------------------------------------------------------
+def asr_languages(video_ids, api_key, status=None):
+    """video_id -> ISO code of the video's automatic captions ('' when none).
+
+    YouTube runs speech recognition on most uploads, and the resulting track is
+    labelled with the language it heard. That is evidence about the audio, which
+    is what the reviewer actually judges - unlike the title, which is often in a
+    different language from the film.
+
+    Costs 50 quota units per video, so callers should pass only the rows no
+    cheaper tier could answer.
+    """
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+
+    youtube = build('youtube', 'v3', developerKey=api_key)
+    out = {}
+    for k, video_id in enumerate(video_ids, 1):
+        try:
+            response = youtube.captions().list(part='snippet',
+                                               videoId=video_id).execute()
+            tracks = [item['snippet'] for item in response.get('items', [])]
+            asr = [t for t in tracks if t.get('trackKind') == 'asr']
+            out[video_id] = (asr[0].get('language') or '') if asr else ''
+        except HttpError as exc:
+            out[video_id] = ''
+            if status and k == 1:
+                status(f'  captions lookup failed ({exc}); ASR tier will be empty')
+    return out
+
+
+def tune_asr_languages(asr_iso, iso2wess, wess_freq, truth):
+    """Keep only the ASR languages whose mapping to WESS is reliable.
+
+    One ASR label often spans many WESS ids - 'id' covers Djambi, Malaysian,
+    North Moluccan Malay and more - and resolving that by history frequency
+    guesses wrong far more often than it guesses right. Measuring per language
+    keeps the ones where the mapping is safe (Spanish, Hindi) and drops the
+    ones where it is not, instead of judging the signal as a whole.
+    """
+    per_lang = defaultdict(lambda: [0, 0])
+    for iso, true_lang in zip(asr_iso, truth):
+        wess = asr_to_wess(iso, iso2wess, wess_freq)
+        if wess is None:
+            continue
+        per_lang[iso][1] += 1
+        per_lang[iso][0] += int(wess == true_lang)
+    keep = {iso: round(hits / n, 4) for iso, (hits, n) in per_lang.items()
+            if n >= ASR_MIN_PER_LANG and hits / n >= ASR_PRECISION}
+    return keep
+
+
+def asr_to_wess(iso_code, iso2wess, wess_freq):
+    """ASR's BCP-47 label -> WESS id, ambiguity resolved by history frequency."""
+    if not iso_code:
+        return None
+    base = str(iso_code).split('-')[0].lower()
+    for iso in ISO1_TO_3.get(base, [base] if len(base) == 3 else []):
+        if iso in iso2wess:
+            return max(iso2wess[iso], key=lambda w: wess_freq.get(w, 0))
+    return None
+
+
 def tune_prob_cutoff(pred_lang, pred_prob, truth):
     grid = np.concatenate([np.arange(0.30, 0.99, 0.01),        # coarse
                            np.arange(0.99, 0.99991, 0.0005)])  # softmax mass sits near 1
@@ -362,7 +432,7 @@ def in_calibration_half(video_id):
     return int(hashlib.md5(str(video_id).encode()).hexdigest(), 16) % 2 == 0
 
 
-def train(history_path, status, exclude_video_ids=(), calib_df=None):
+def train(history_path, status, exclude_video_ids=(), calib_df=None, asr_key=None):
     """Fit signals on labeled history and tune per-tier cutoffs.
 
     Cutoffs are tuned on the calibration half of a reviewed batch when one is
@@ -426,6 +496,22 @@ def train(history_path, status, exclude_video_ids=(), calib_df=None):
     if best_title:
         tiers['TITLE'] = best_title
 
+    # ---- ASR: trust the audio, but only for languages whose mapping is safe
+    if asr_key:
+        status('  ASR: fetching automatic-caption languages for the tuning half')
+        ids = [normalize_id(v) for v in tune_df['video_id']]
+        asr_map = asr_languages(ids, asr_key, status)
+        asr_iso = [asr_map.get(v, '') for v in ids]
+        keep = tune_asr_languages(asr_iso, iso2wess, wess_freq, truth)
+        fired = sum(1 for iso in asr_iso if iso.split('-')[0].lower() in keep)
+        if keep and fired >= MIN_BUCKET_N:
+            tiers['ASR'] = {'languages': keep}
+            status(f'  ASR: trusting {len(keep)} language(s) {sorted(keep)}, '
+                   f'fires on {fired} of {len(tune_df)}')
+        else:
+            status(f'  ASR: no language met {ASR_PRECISION} on >= {ASR_MIN_PER_LANG} '
+                   f'rows (or too few fires); tier disabled')
+
     # ---- FASTTEXT supervised (channel-prior tokens + title): tune cutoff
     ft_model = train_fasttext(fit_df, counters, status)
     inputs = [ft_input(t, channel_tokens(counters.get(c)))
@@ -478,6 +564,10 @@ def train(history_path, status, exclude_video_ids=(), calib_df=None):
         artifact['title_rules'] = {k: list(v) for k, v in rules.items()}
     if 'LID' in tiers:
         artifact['lid_label_map'] = build_lid_label_map(get_lid_model(), iso2wess, wess_freq_all)
+    if 'ASR' in tiers:
+        # the tier resolves ISO -> WESS at predict time, so it needs both tables
+        artifact['iso2wess'] = {k: sorted(v) for k, v in iso2wess.items()}
+        artifact['wess_freq'] = {k: int(v) for k, v in wess_freq_all.items()}
 
     final_ft = None
     if 'FASTTEXT' in tiers:
@@ -496,7 +586,7 @@ def load_artifact():
 # ---------------------------------------------------------------------------
 # Prediction
 # ---------------------------------------------------------------------------
-def predict(df, artifact, status):
+def predict(df, artifact, status, asr_key=None):
     tiers = artifact['tiers']
     wess2name = artifact['wess2name']
     n = len(df)
@@ -520,6 +610,22 @@ def predict(df, artifact, status):
                 match = apply_title_rules(title, rules)
                 if match:
                     assign(i, match[0], 'TITLE', match[1])
+
+    pending = [i for i in range(n) if source[i] == 'REVIEW']
+    if 'ASR' in tiers and pending and asr_key:
+        keep = tiers['ASR']['languages']
+        iso2wess = artifact['iso2wess']
+        wess_freq = artifact['wess_freq']
+        ids = [normalize_id(df['video_id'].iloc[i]) for i in pending]
+        status(f'  ASR: looking up captions for {len(ids)} unanswered claims')
+        asr_map = asr_languages(ids, asr_key, status)
+        for i, video_id in zip(pending, ids):
+            iso = asr_map.get(video_id, '')
+            base = iso.split('-')[0].lower()
+            if base in keep:
+                wess = asr_to_wess(iso, iso2wess, wess_freq)
+                if wess is not None:
+                    assign(i, wess, 'ASR', keep[base])
 
     pending = [i for i in range(n) if source[i] == 'REVIEW']
     if 'FASTTEXT' in tiers and pending:
@@ -606,6 +712,14 @@ def evaluate(out_df, labels_path, status, calibrated=False):
 def main(args, status_callback=print):
     status = status_callback
 
+    # The ASR tier reads YouTube's automatic captions, which costs 50 quota
+    # units per video, so it is opt-in. Everything else runs offline.
+    asr_key = None
+    if getattr(args, 'asr', False):
+        from helpers import load_env
+        load_env(['YT_API_KEY'])
+        asr_key = os.environ['YT_API_KEY']
+
     df = pandas.read_csv(args.prediction_input, low_memory=False)
 
     exclude = ()
@@ -627,9 +741,9 @@ def main(args, status_callback=print):
             calib_df['video_title'] = calib_df['video_title'].fillna('')
             calibrated = len(calib_df) >= 4 * MIN_BUCKET_N
         artifact = train(args.history, status, exclude_video_ids=exclude,
-                         calib_df=calib_df)
+                         calib_df=calib_df, asr_key=asr_key)
 
-    out = predict(df, artifact, status)
+    out = predict(df, artifact, status, asr_key=asr_key)
     out.to_csv(args.prediction_output, index=False)
     status(f'Saved predictions to {args.prediction_output}')
 
@@ -644,6 +758,10 @@ if __name__ == '__main__':
                         help='all_claims export with language_id (required when no cached artifact)')
     parser.add_argument('--eval-labels', default=None,
                         help='Completed monthly sheet (video_id + language_id) to score against')
+    parser.add_argument('--asr', action='store_true',
+                        help='Consult YouTube automatic captions for claims no '
+                             'cheaper tier could answer (50 quota units each; '
+                             'needs YT_API_KEY)')
     parser.add_argument('--prediction-output',
                         default=f'wess_predictions_{datetime.now().strftime("%Y%m%d%H%M")}.csv',
                         help='Output CSV')

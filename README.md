@@ -106,6 +106,14 @@ cutoff, calibrated to >= 95% precision, is met; everything else is `REVIEW`:
    e.g. "bahasa melayu jambi")
 3. `FASTTEXT` — supervised fastText classifier over channel-prior tokens
    (channel's top historical languages, leave-one-out at fit time) + title text
+3b. `ASR` — YouTube's automatic captions for the video, ISO -> WESS. Opt-in
+   (`--asr`), because it costs 50 quota units per video and is only consulted
+   for claims no cheaper tier answered. Trusted **per language**: one ASR label
+   often spans many WESS ids (`id` covers Djambi, Malaysian, North Moluccan
+   Malay...), so tuning measures each language separately and keeps only those
+   reaching `ASR_PRECISION` (0.90) on at least `ASR_MIN_PER_LANG` (25) rows. Measured on a
+   300-row July sample: Spanish 32/32, Hindi 33/36, English 13/17,
+   Indonesian 5/51 — so `es`/`hi` are kept and `en`/`id` dropped.
 4. `LID` — pretrained lid.176 language ID on the title, ISO -> WESS via the
    sheets mapping, ambiguous codes resolved by history frequency
 
