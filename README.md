@@ -101,9 +101,10 @@ unprocessed claims. Precision-first cascade — a tier only fires when its
 cutoff, calibrated to >= 95% precision, is met; everything else is `REVIEW`:
 
 1. `CHANNEL` — the channel's labeled history is unanimous (min claim count is tuned)
-2. `TITLE` — the title contains a validated language-name rule (Anglicized
-   names from the sheets mapping plus native-name aliases mined from history,
-   e.g. "bahasa melayu jambi"). When a title names several languages the
+2. `TITLE` — the title contains a validated language-name rule. Names come from
+   every name column of the sheet (`Anglicized_name`, `Language_JFProd`,
+   `Language_name_WCD`, `Dialect_name`), plus native-name aliases mined from history,
+   e.g. "bahasa melayu jambi". When a title names several languages the
    last-named one wins ("Creole French Haitian" -> Haitian, not French)
 3. `FASTTEXT` — supervised fastText classifier over channel-prior tokens
    (channel's top historical languages, leave-one-out at fit time) + title text

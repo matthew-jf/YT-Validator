@@ -43,6 +43,7 @@ PRECISION_TARGET = 0.95   # per-tier precision required on the tuning set
 MIN_BUCKET_N = 25         # a tier must fire at least this often on the tuning set
 VAL_DAYS = 120            # temporal-holdout fallback when no reviewed batch is given
 CASCADE = ['CHANNEL', 'TITLE', 'ASR', 'FASTTEXT', 'LID']
+MAX_TITLE_WORDS = 3       # longest phrase matched in a title, and indexed from a name
 ASR_MIN_PER_LANG = 25     # tuning rows an ASR language needs before it is judged
                           # (matches MIN_BUCKET_N: 5/5 passes on luck alone)
 ASR_PRECISION = 0.90      # ...and the precision it must reach to be trusted
@@ -106,7 +107,7 @@ def norm_title(title):
     return ' '.join(text.split())
 
 
-def title_phrases(title, max_words=3):
+def title_phrases(title, max_words=MAX_TITLE_WORDS):
     """All 1..max_words word n-grams of the lowercased title, longest first."""
     tokens = re.findall(r'\w+', str(title).lower())
     for n in range(min(max_words, len(tokens)), 0, -1):
@@ -114,19 +115,38 @@ def title_phrases(title, max_words=3):
             yield ' '.join(tokens[i:i + n])
 
 
+# Every column of the sheet that carries a name a person might type in a title.
+# Anglicized_name is the display name; the others are the production name
+# ("LESSER ANTILLEAN CREOLE FRENCH"), the World Christian Database name, and the
+# dialect. Titles use all of them, so all of them are matchable.
+NAME_COLUMNS = ('Anglicized_name', 'Language_JFProd', 'Language_name_WCD', 'Dialect_name')
+
+
 def load_mapping():
-    """sheets_language_families.csv -> (wess2name, name2wess, iso2wess)."""
+    """sheets_language_families.csv -> (wess2name, name2wess, iso2wess).
+
+    name2wess indexes each name AND its 2..MAX_TITLE_WORDS word windows, because
+    titles reorder and abbreviate: "Creole French Lesser Antillean" never equals
+    "Lesser Antillean Creole French", but does contain "lesser antillean".
+    """
     sheet = pandas.read_csv(SHEETS_PATH, dtype=str).fillna('')
     wess2name, name2wess, iso2wess = {}, defaultdict(set), defaultdict(set)
     for _, row in sheet.iterrows():
         wess = norm_lang(row['WESS_LAN_num'])
         if not wess:
             continue
-        name = row['Anglicized_name'].strip()
+        display = row.get('Anglicized_name', '').strip()
+        wess2name.setdefault(wess, display)
+        for column in NAME_COLUMNS:
+            name = str(row.get(column, '')).strip().lower()
+            if len(name) < 3:  # blank or near-blank names would match everything
+                continue
+            name2wess[name].add(wess)
+            tokens = re.findall(r'\w+', name)
+            for n in range(2, min(MAX_TITLE_WORDS, len(tokens)) + 1):
+                for i in range(len(tokens) - n + 1):
+                    name2wess[' '.join(tokens[i:i + n])].add(wess)
         iso = row['ISO_lang'].strip().lower()
-        wess2name.setdefault(wess, name)
-        if name:  # a handful of rows have a blank name; they'd match everything
-            name2wess[name.lower()].add(wess)
         if iso:
             iso2wess[iso].add(wess)
     return wess2name, dict(name2wess), dict(iso2wess)
@@ -226,7 +246,7 @@ def build_title_rules(name2wess, wess_freq, train_df, cfg):
     return rules
 
 
-def apply_title_rules(title, rules, max_words=3):
+def apply_title_rules(title, rules, max_words=MAX_TITLE_WORDS):
     """When a title names several languages, the last-named one wins.
 
     Uploaders put the specific language last ("Creole French Haitian" is
