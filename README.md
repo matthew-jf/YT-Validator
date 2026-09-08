@@ -103,7 +103,8 @@ cutoff, calibrated to >= 95% precision, is met; everything else is `REVIEW`:
 1. `CHANNEL` — the channel's labeled history is unanimous (min claim count is tuned)
 2. `TITLE` — the title contains a validated language-name rule (Anglicized
    names from the sheets mapping plus native-name aliases mined from history,
-   e.g. "bahasa melayu jambi")
+   e.g. "bahasa melayu jambi"). When a title names several languages the
+   last-named one wins ("Creole French Haitian" -> Haitian, not French)
 3. `FASTTEXT` — supervised fastText classifier over channel-prior tokens
    (channel's top historical languages, leave-one-out at fit time) + title text
 3b. `ASR` — YouTube's automatic captions for the video, ISO -> WESS. Opt-in

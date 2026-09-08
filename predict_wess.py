@@ -6,7 +6,8 @@ temporal holdout of labeled history (same triage philosophy as pipeline.py):
   1. CHANNEL  - the channel's historical claims all carry one language_id
   2. TITLE    - the title contains a validated language-name rule
                 (Anglicized names from sheets_language_families.csv plus
-                native-name aliases mined from history, e.g. "bahasa melayu jambi")
+                native-name aliases mined from history, e.g. "bahasa melayu jambi");
+                when several languages are named, the last-named one wins
   3. FASTTEXT - supervised fastText classifier trained on historical
                 (video_title -> language_id) pairs
   4. LID      - pretrained lid.176 language ID on the title, ISO -> WESS via
@@ -225,12 +226,22 @@ def build_title_rules(name2wess, wess_freq, train_df, cfg):
     return rules
 
 
-def apply_title_rules(title, rules):
-    """Longest matching phrase wins (n-grams are generated longest first)."""
-    for phrase in title_phrases(title):
-        if phrase in rules:
-            return rules[phrase]
-    return None
+def apply_title_rules(title, rules, max_words=3):
+    """When a title names several languages, the last-named one wins.
+
+    Uploaders put the specific language last ("Creole French Haitian" is
+    Haitian, not French), so the matching phrase that ends furthest right is
+    taken. Phrases ending on the same word prefer the longer one ("chem chang"
+    over "chang").
+    """
+    tokens = re.findall(r'\w+', str(title).lower())
+    best = None  # (end, n, phrase)
+    for n in range(min(max_words, len(tokens)), 0, -1):
+        for i in range(len(tokens) - n + 1):
+            phrase = ' '.join(tokens[i:i + n])
+            if phrase in rules and (best is None or (i + n, n) > best[:2]):
+                best = (i + n, n, phrase)
+    return rules[best[2]] if best else None
 
 
 # ---------------------------------------------------------------------------
