@@ -26,12 +26,18 @@ BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / 'model.joblib'
 LICENSED_PATH = BASE_DIR / 'Licensed.csv'
 ASSET_MEDIA_PATH = BASE_DIR / 'assets_single_media_component.csv'
+CHANNEL_VERDICTS_PATH = BASE_DIR / 'channel_verdicts.csv'
 
 RANDOM_STATE = 42
 TRAIN_START = pandas.Timestamp('2022-01-01')  # recency window that validated best
 HOLDOUT_DAYS = 150          # most recent labeled claims, used to tune thresholds
 BUCKET_TARGET = 0.95        # per-bucket accuracy target for triage cutoffs
 MIN_BUCKET_N = 50
+MIN_CHANNEL_CLAIMS = 3      # labeled claims a unanimous channel needs before its
+                            # history can upgrade REVIEW rows to AUTO_N_CHANNEL
+CHANNEL_RATING_CAP = 0.025  # ...and the model probability must also be this low.
+                            # Calibrated on the July 2026 reviewed batch: 95.4%
+                            # accurate there; without the cap the bucket is 83%.
 
 # The artifact is deserialised once per process rather than once per request, and
 # app.py warms it at startup so a corrupt model fails the service immediately
@@ -123,6 +129,43 @@ NUMERIC = [
 LOW_CARD = ['claim_type', 'claim_origin', 'content_type', 'claim_report_source', 'asset_labels']
 HIGH_CARD = ['asset_id', 'custom_id', 'reference_id', 'channel_id']
 FEATURES = NUMERIC + LOW_CARD + HIGH_CARD
+
+
+def read_claims_csv(path):
+    """Read a claims export, tolerating the malformed rows some exports contain.
+
+    Unbalanced quotes crash pandas' C parser with "Buffer overflow caught";
+    fall back to the slower python parser and drop the handful of bad lines.
+    """
+    try:
+        return pandas.read_csv(path, low_memory=False)
+    except pandas.errors.ParserError:
+        return pandas.read_csv(path, engine='python', on_bad_lines='skip')
+
+
+def build_channel_verdicts(labeled_df, out_path=CHANNEL_VERDICTS_PATH):
+    """Derive each channel's unanimous verdict history from labeled claims.
+
+    Keeps only channels whose Y/N verdicts all agree. Rule-driven verdicts
+    (no_code L/V/N/X) are dropped when the export carries no_code, mirroring
+    the training exclusions. Writes a bundled CSV (channel_id, verdict,
+    n_claims) that main() consumes at predict time.
+    """
+    df = labeled_df.assign(verdict=labeled_df['verdict'].astype(str).str.upper())
+    df = df[df['verdict'].isin(['Y', 'N'])]
+    if 'no_code' in df.columns:
+        df = df[~df['no_code'].astype(str).str.upper().isin(excluded_codes)]
+    df = df.dropna(subset=['channel_id'])
+
+    per_channel = df.groupby('channel_id')['verdict'].agg(['first', 'nunique', 'size'])
+    unanimous = per_channel[per_channel['nunique'] == 1]
+    out = pandas.DataFrame({
+        'channel_id': unanimous.index,
+        'verdict': unanimous['first'].to_numpy(),
+        'n_claims': unanimous['size'].to_numpy(),
+    })
+    out.to_csv(out_path, index=False)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -218,11 +261,14 @@ def train_model(training_data, status_callback=None, check_stopped=None):
             status_callback(msg)
 
     status('Loading training data')
-    df = pandas.read_csv(training_data, low_memory=False)
+    df = read_claims_csv(training_data)
     df['verdict'] = df['verdict'].astype(str).str.upper()
     df = df[df['verdict'].isin(['Y', 'N'])]
     if 'no_code' in df.columns:
         df = df[~df['no_code'].isin(excluded_codes)]
+
+    status('Rebuilding channel verdict history')
+    build_channel_verdicts(df)
 
     X = build_features(df)
     y = (df['verdict'] == 'Y').astype(int).to_numpy()
@@ -348,7 +394,7 @@ def main(args, status_callback=None, stop_check=None):
     t_low, t_high = artifact['t_low'], artifact['t_high']
 
     # -----------------------------------------------------------------------
-    # Load licensed assets and asset->media_component mapping
+    # Load licensed assets, asset->media_component mapping, channel history
     # -----------------------------------------------------------------------
     licensed_df = pandas.read_csv(LICENSED_PATH)
     licensed_asset_ids = set(licensed_df['asset_id'].dropna().unique())
@@ -357,10 +403,12 @@ def main(args, status_callback=None, stop_check=None):
     asset_to_media_component = dict(zip(assets_media_df['asset_id'],
                                         assets_media_df['media_component_id']))
 
+    channel_hist = pandas.read_csv(CHANNEL_VERDICTS_PATH).set_index('channel_id')
+
     # -----------------------------------------------------------------------
     # Process unprocessed claims
     # -----------------------------------------------------------------------
-    df = pandas.read_csv(args.prediction_input, low_memory=False)
+    df = read_claims_csv(args.prediction_input)
 
     # Add licensed boolean column
     df['licensed'] = df['asset_id'].isin(licensed_asset_ids)
@@ -410,6 +458,24 @@ def main(args, status_callback=None, stop_check=None):
         [licensed, unavailable, proba <= t_low, proba >= t_high],
         ['AUTO_N_LICENSED', 'AUTO_N_UNAVAILABLE', 'AUTO_N', 'AUTO_Y'],
         default='REVIEW')
+
+    # Channel-history triage assist. A unanimous channel history alone is too
+    # weak to auto-decide (~83% accurate on the July 2026 reviewed batch), so
+    # REVIEW rows are upgraded only when the model also strongly leans N
+    # (rating <= CHANNEL_RATING_CAP). The channel condition is load-bearing:
+    # low-rating REVIEW rows without it are ~88% N, with it ~95%. Unanimous-Y
+    # history is exposed for reviewers but never auto-decides (<70% accurate).
+    df['channel_history_verdict'] = df['channel_id'].map(channel_hist['verdict'])
+    df['channel_history_claims'] = (
+        df['channel_id'].map(channel_hist['n_claims']).fillna(0).astype(int))
+    channel_auto_n = (
+        (df['triage'] == 'REVIEW')
+        & (df['predicted_verdict'] == 'N')
+        & (df['rating'] <= CHANNEL_RATING_CAP)
+        & (df['channel_history_verdict'] == 'N')
+        & (df['channel_history_claims'] >= MIN_CHANNEL_CLAIMS)
+    )
+    df.loc[channel_auto_n, 'triage'] = 'AUTO_N_CHANNEL'
 
     # Save predictions
     df.to_csv(args.prediction_output, index=False)
