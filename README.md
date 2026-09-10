@@ -104,13 +104,23 @@ cutoff, calibrated to >= 95% precision, is met; everything else is `REVIEW`:
 2. `TITLE` — the title contains a validated language-name rule. Names come from
    every name column of the sheet (`Anglicized_name`, `Language_JFProd`,
    `Language_name_WCD`, `Dialect_name`), plus native-name aliases mined from history,
-   e.g. "bahasa melayu jambi". When a title names several languages the
-   last-named one wins ("Creole French Haitian" -> Haitian, not French)
+   e.g. "bahasa melayu jambi". Phrases match by their *words*, not their word
+   order, so "Creole Haitian" and "Haitian Creole" are one rule. When a title
+   names several languages the longest name wins, and the last-named breaks a
+   tie ("Creole French Haitian" -> Haitian, not French)
 3. `FASTTEXT` — supervised fastText classifier over channel-prior tokens
    (channel's top historical languages, leave-one-out at fit time) + title text
 3b. `ASR` — YouTube's automatic captions for the video, ISO -> WESS. Opt-in
-   (`--asr`), because it costs 50 quota units per video and is only consulted
-   for claims no cheaper tier answered. Trusted **per language**: one ASR label
+   (`--asr`), because it costs 50 quota units per video, cannot be batched, and
+   shares the 10,000/day key with production. It is consulted for two kinds of
+   row: **contested titles** (the title named several languages, so the TITLE
+   tiebreak had to choose — ASR may override its answer) and then claims no
+   cheaper tier answered. Contested titles are looked up first because they are
+   few and high-value; `--asr-limit` (default 200 = the whole daily key) caps the
+   rest, and anything past the budget stays at REVIEW. Left uncapped, a month
+   batch asks for ~133,000 units, 13x the daily allowance — which would exhaust
+   the availability lookups the production pipeline depends on. Trusted
+   **per language**: one ASR label
    often spans many WESS ids (`id` covers Djambi, Malaysian, North Moluccan
    Malay...), so tuning measures each language separately and keeps only those
    reaching `ASR_PRECISION` (0.90) on at least `ASR_MIN_PER_LANG` (25) rows. Measured on a

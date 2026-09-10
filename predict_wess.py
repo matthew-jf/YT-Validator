@@ -7,7 +7,8 @@ temporal holdout of labeled history (same triage philosophy as pipeline.py):
   2. TITLE    - the title contains a validated language-name rule
                 (Anglicized names from sheets_language_families.csv plus
                 native-name aliases mined from history, e.g. "bahasa melayu jambi");
-                when several languages are named, the last-named one wins
+                when several languages are named, the longest name wins, and
+                the last-named breaks a tie
   3. FASTTEXT - supervised fastText classifier trained on historical
                 (video_title -> language_id) pairs
   4. LID      - pretrained lid.176 language ID on the title, ISO -> WESS via
@@ -47,6 +48,10 @@ MAX_TITLE_WORDS = 3       # longest phrase matched in a title, and indexed from 
 ASR_MIN_PER_LANG = 25     # tuning rows an ASR language needs before it is judged
                           # (matches MIN_BUCKET_N: 5/5 passes on luck alone)
 ASR_PRECISION = 0.90      # ...and the precision it must reach to be trusted
+ASR_DEFAULT_LIMIT = 100   # captions.list lookups per PHASE - tuning and prediction each get
+                          # this many. 50 quota units per lookup, so a full run costs at most
+                          # 2 x 100 x 50 = 10,000 units: exactly the daily key that production
+                          # shares. Uncapped, tuning alone would ask for 8 days of quota.
 
 # fastText lid.176 labels are mostly ISO 639-1; the sheets mapping uses 639-3.
 # Candidates are tried in order until one exists in the mapping.
@@ -107,12 +112,22 @@ def norm_title(title):
     return ' '.join(text.split())
 
 
+def canon_phrase(text):
+    """Lowercased words of a phrase, sorted, so word order stops mattering.
+
+    A language name is a set of words, not a sequence: the sheet says "Haitian
+    Creole" and a title may say "Creole Haitian". Both canonicalise to
+    "creole haitian" and match the same rule.
+    """
+    return ' '.join(sorted(re.findall(r'\w+', str(text).lower())))
+
+
 def title_phrases(title, max_words=MAX_TITLE_WORDS):
-    """All 1..max_words word n-grams of the lowercased title, longest first."""
+    """All 1..max_words word n-grams of the title, canonicalised, longest first."""
     tokens = re.findall(r'\w+', str(title).lower())
     for n in range(min(max_words, len(tokens)), 0, -1):
         for i in range(len(tokens) - n + 1):
-            yield ' '.join(tokens[i:i + n])
+            yield ' '.join(sorted(tokens[i:i + n]))
 
 
 # Every column of the sheet that carries a name a person might type in a title.
@@ -125,9 +140,10 @@ NAME_COLUMNS = ('Anglicized_name', 'Language_JFProd', 'Language_name_WCD', 'Dial
 def load_mapping():
     """sheets_language_families.csv -> (wess2name, name2wess, iso2wess).
 
-    name2wess indexes each name AND its 2..MAX_TITLE_WORDS word windows, because
-    titles reorder and abbreviate: "Creole French Lesser Antillean" never equals
-    "Lesser Antillean Creole French", but does contain "lesser antillean".
+    name2wess indexes each name AND its 2..MAX_TITLE_WORDS word windows, every
+    key canonicalised by canon_phrase(), because titles reorder and abbreviate:
+    "Creole French Lesser Antillean" never equals "Lesser Antillean Creole
+    French" as a string, but names the same language and shares its words.
     """
     sheet = pandas.read_csv(SHEETS_PATH, dtype=str).fillna('')
     wess2name, name2wess, iso2wess = {}, defaultdict(set), defaultdict(set)
@@ -141,11 +157,11 @@ def load_mapping():
             name = str(row.get(column, '')).strip().lower()
             if len(name) < 3:  # blank or near-blank names would match everything
                 continue
-            name2wess[name].add(wess)
+            name2wess[canon_phrase(name)].add(wess)
             tokens = re.findall(r'\w+', name)
             for n in range(2, min(MAX_TITLE_WORDS, len(tokens)) + 1):
                 for i in range(len(tokens) - n + 1):
-                    name2wess[' '.join(tokens[i:i + n])].add(wess)
+                    name2wess[' '.join(sorted(tokens[i:i + n]))].add(wess)
         iso = row['ISO_lang'].strip().lower()
         if iso:
             iso2wess[iso].add(wess)
@@ -214,7 +230,7 @@ def mine_bahasa_aliases(df):
         if match:
             words = match.group(1).split()
             for n in range(1, len(words) + 1):
-                phrases.add('bahasa ' + ' '.join(words[:n]))
+                phrases.add(canon_phrase('bahasa ' + ' '.join(words[:n])))
     return phrases
 
 
@@ -247,21 +263,28 @@ def build_title_rules(name2wess, wess_freq, train_df, cfg):
 
 
 def apply_title_rules(title, rules, max_words=MAX_TITLE_WORDS):
-    """When a title names several languages, the last-named one wins.
+    """When a title names several languages, the most specific one wins.
 
-    Uploaders put the specific language last ("Creole French Haitian" is
-    Haitian, not French), so the matching phrase that ends furthest right is
-    taken. Phrases ending on the same word prefer the longer one ("chem chang"
-    over "chang").
+    Phrases are matched by canon_phrase(), so word order does not matter. A
+    longer matching phrase names a narrower language and is preferred:
+    "Haitian Creole French" is Haitian, not French. Where two phrases are the
+    same length the last-named wins, because uploaders put the specific
+    language after the family ("Creole French Haitian" is also Haitian).
     """
     tokens = re.findall(r'\w+', str(title).lower())
-    best = None  # (end, n, phrase)
+    best, answers = None, set()
     for n in range(min(max_words, len(tokens)), 0, -1):
         for i in range(len(tokens) - n + 1):
-            phrase = ' '.join(tokens[i:i + n])
-            if phrase in rules and (best is None or (i + n, n) > best[:2]):
-                best = (i + n, n, phrase)
-    return rules[best[2]] if best else None
+            phrase = ' '.join(sorted(tokens[i:i + n]))
+            if phrase in rules:
+                answers.add(rules[phrase][0])
+                if best is None or (n, i + n) > best[:2]:
+                    best = (n, i + n, phrase)
+    if best is None:
+        return None
+    # third element: the title named several languages, so the key above had to
+    # choose - ASR is consulted on exactly these rows (see predict()).
+    return (*rules[best[2]], len(answers) > 1)
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +486,8 @@ def in_calibration_half(video_id):
     return int(hashlib.md5(str(video_id).encode()).hexdigest(), 16) % 2 == 0
 
 
-def train(history_path, status, exclude_video_ids=(), calib_df=None, asr_key=None):
+def train(history_path, status, exclude_video_ids=(), calib_df=None, asr_key=None,
+          asr_limit=ASR_DEFAULT_LIMIT):
     """Fit signals on labeled history and tune per-tier cutoffs.
 
     Cutoffs are tuned on the calibration half of a reviewed batch when one is
@@ -496,6 +520,10 @@ def train(history_path, status, exclude_video_ids=(), calib_df=None, asr_key=Non
     counters = channel_counters(fit_df)
     truth = tune_df['lang'].tolist()
     tiers = {}
+    # Why each tier that failed its gate was dropped. A disabled tier used to
+    # vanish from the artifact with no trace, which makes a tier that stopped
+    # firing indistinguishable from one that was never built.
+    disabled = {}
 
     # ---- CHANNEL: smallest min_count whose tuning precision meets target
     for min_count in (1, 2, 3, 5, 10):
@@ -504,10 +532,16 @@ def train(history_path, status, exclude_video_ids=(), calib_df=None, asr_key=Non
                            zip(tune_df['channel_id'], truth)])
         status(f'  CHANNEL min_count={min_count}: precision {prec:.3f} on {n}')
         if n < MIN_BUCKET_N:
+            disabled['CHANNEL'] = {'reason': f'fired {n} < {MIN_BUCKET_N} at min_count={min_count}',
+                                   'val_precision': round(prec, 4), 'val_n': n}
             break
         if prec >= PRECISION_TARGET:
             tiers['CHANNEL'] = {'min_count': min_count, 'val_precision': round(prec, 4), 'val_n': n}
+            disabled.pop('CHANNEL', None)   # a looser min_count failing is not a failed tier
             break
+        disabled['CHANNEL'] = {'reason': f'best precision {prec:.3f} < {PRECISION_TARGET} '
+                                         f'(min_count={min_count}, fired {n})',
+                               'val_precision': round(prec, 4), 'val_n': n}
 
     # ---- TITLE: among configs meeting the target, widest coverage wins
     title_cfgs = [
@@ -516,22 +550,34 @@ def train(history_path, status, exclude_video_ids=(), calib_df=None, asr_key=Non
         {'min_n': 3, 'min_prec': 0.9, 'keep_unseen': True, 'min_len_unseen': 5},
     ]
     best_title = None
+    last_title_prec, last_title_n = 0.0, 0
     for cfg in title_cfgs:
         rules = build_title_rules(name2wess, wess_freq, fit_df, cfg)
         prec, n = measure([(match[0] if (match := apply_title_rules(t, rules)) else None, t_lang)
                            for t, t_lang in zip(tune_df['video_title'], truth)])
         status(f'  TITLE {cfg}: {len(rules)} rules, precision {prec:.3f} on {n}')
+        if n > last_title_n:
+            last_title_prec, last_title_n = prec, n
         if n >= MIN_BUCKET_N and prec >= PRECISION_TARGET:
             if best_title is None or n > best_title['val_n']:
                 best_title = {'cfg': cfg, 'val_precision': round(prec, 4), 'val_n': n}
     if best_title:
         tiers['TITLE'] = best_title
+        disabled.pop('TITLE', None)
+    else:
+        disabled['TITLE'] = {'reason': f'no config reached {PRECISION_TARGET} on >= {MIN_BUCKET_N} '
+                                       f'rows (best: {last_title_prec:.3f} on {last_title_n})',
+                             'val_precision': round(last_title_prec, 4), 'val_n': last_title_n}
 
     # ---- ASR: trust the audio, but only for languages whose mapping is safe
     if asr_key:
-        status('  ASR: fetching automatic-caption languages for the tuning half')
+        # Budgeted like the prediction pass: an uncapped tuning half would ask
+        # for several days of quota and exhaust the key production shares.
         ids = [normalize_id(v) for v in tune_df['video_id']]
-        asr_map = asr_languages(ids, asr_key, status)
+        looked_up = ids[:asr_limit]
+        status(f'  ASR: fetching caption languages for {len(looked_up)} of {len(ids)} '
+               f'tuning rows = {len(looked_up) * 50:,} quota units')
+        asr_map = asr_languages(looked_up, asr_key, status)
         asr_iso = [asr_map.get(v, '') for v in ids]
         keep = tune_asr_languages(asr_iso, iso2wess, wess_freq, truth)
         fired = sum(1 for iso in asr_iso if iso.split('-')[0].lower() in keep)
@@ -540,6 +586,10 @@ def train(history_path, status, exclude_video_ids=(), calib_df=None, asr_key=Non
             status(f'  ASR: trusting {len(keep)} language(s) {sorted(keep)}, '
                    f'fires on {fired} of {len(tune_df)}')
         else:
+            disabled['ASR'] = {'reason': f'no ISO code reached {ASR_MIN_PER_LANG} rows at '
+                                         f'{ASR_PRECISION} precision (looked up {len(looked_up)} '
+                                         f'of {len(ids)} tuning rows)',
+                               'val_n': fired}
             status(f'  ASR: no language met {ASR_PRECISION} on >= {ASR_MIN_PER_LANG} '
                    f'rows (or too few fires); tier disabled')
 
@@ -554,6 +604,8 @@ def train(history_path, status, exclude_video_ids=(), calib_df=None, asr_key=Non
         tiers['FASTTEXT'] = {'cutoff': cutoff, 'val_precision': round(prec, 4), 'val_n': n}
         status(f'  FASTTEXT: cutoff {cutoff:.2f}, precision {prec:.3f} on {n}')
     else:
+        disabled['FASTTEXT'] = {'reason': f'no cutoff on the grid reached {PRECISION_TARGET} '
+                                          f'on >= {MIN_BUCKET_N} rows'}
         status('  FASTTEXT: no cutoff met the precision target; tier disabled')
 
     # ---- LID pretrained: tune cutoff
@@ -567,8 +619,11 @@ def train(history_path, status, exclude_video_ids=(), calib_df=None, asr_key=Non
             tiers['LID'] = {'cutoff': cutoff, 'val_precision': round(prec, 4), 'val_n': n}
             status(f'  LID: cutoff {cutoff:.2f}, precision {prec:.3f} on {n}')
         else:
+            disabled['LID'] = {'reason': f'no cutoff on the grid reached {PRECISION_TARGET} '
+                                         f'on >= {MIN_BUCKET_N} rows'}
             status('  LID: no cutoff met the precision target; tier disabled')
     except Exception as exc:
+        disabled['LID'] = {'reason': f'model unavailable: {exc}'}
         status(f'  LID tier disabled ({exc})')
 
     if fit_df is not df:
@@ -577,6 +632,7 @@ def train(history_path, status, exclude_video_ids=(), calib_df=None, asr_key=Non
     counters_all = channel_counters(df)
     artifact = {
         'tiers': tiers,
+        'disabled_tiers': disabled,
         'wess2name': wess2name,
         'channel_tokens': {ch: channel_tokens(ctr) for ch, ctr in counters_all.items()},
         'metadata': {
@@ -607,6 +663,10 @@ def train(history_path, status, exclude_video_ids=(), calib_df=None, asr_key=Non
     ARTIFACT_PATH.write_text(json.dumps(artifact))
     status(f'Saved {ARTIFACT_PATH.name}'
            + (f' + {FT_MODEL_PATH.name}' if final_ft else ''))
+    status(f'Tiers live: {" -> ".join(t for t in CASCADE if t in tiers) or "none"}')
+    for tier in CASCADE:
+        if tier in disabled:
+            status(f'  {tier} disabled: {disabled[tier]["reason"]}')
     return artifact
 
 
@@ -617,13 +677,18 @@ def load_artifact():
 # ---------------------------------------------------------------------------
 # Prediction
 # ---------------------------------------------------------------------------
-def predict(df, artifact, status, asr_key=None):
+def predict(df, artifact, status, asr_key=None, asr_limit=ASR_DEFAULT_LIMIT):
     tiers = artifact['tiers']
     wess2name = artifact['wess2name']
     n = len(df)
     lang = [None] * n
     source = ['REVIEW'] * n
     conf = [np.nan] * n
+    contested = []   # TITLE rows whose title named more than one language
+    off = artifact.get('disabled_tiers', {})
+    if off:
+        status('Tiers not in this artifact: '
+               + '; '.join(f'{t} ({off[t]["reason"]})' for t in CASCADE if t in off))
 
     def assign(i, language, tier, confidence):
         lang[i], source[i], conf[i] = language, tier, round(float(confidence), 4)
@@ -641,16 +706,31 @@ def predict(df, artifact, status, asr_key=None):
                 match = apply_title_rules(title, rules)
                 if match:
                     assign(i, match[0], 'TITLE', match[1])
+                    if match[2]:
+                        contested.append(i)
 
     pending = [i for i in range(n) if source[i] == 'REVIEW']
-    if 'ASR' in tiers and pending and asr_key:
+    # ASR arbitrates the handful of titles that named several languages, and
+    # otherwise answers rows no cheaper tier could. Contested titles come first
+    # because they are few and high-value; the unanswered tail is whatever the
+    # quota budget still allows. captions.list costs 50 units and cannot be
+    # batched, so an unbounded run would ask for many times the daily key and
+    # exhaust the availability lookups production depends on.
+    targets = contested + pending
+    if 'ASR' in tiers and targets and asr_key:
+        skipped = max(0, len(targets) - asr_limit)
+        targets = targets[:asr_limit]
         keep = tiers['ASR']['languages']
         iso2wess = artifact['iso2wess']
         wess_freq = artifact['wess_freq']
-        ids = [normalize_id(df['video_id'].iloc[i]) for i in pending]
-        status(f'  ASR: looking up captions for {len(ids)} unanswered claims')
+        ids = [normalize_id(df['video_id'].iloc[i]) for i in targets]
+        status(f'  ASR: {len(targets)} lookups ({len(contested)} contested titles first, '
+               f'then unanswered claims) = {len(targets) * 50:,} quota units')
+        if skipped:
+            status(f'  ASR: {skipped:,} rows left for REVIEW - budget --asr-limit is '
+                   f'{asr_limit}; raising it costs 50 units each')
         asr_map = asr_languages(ids, asr_key, status)
-        for i, video_id in zip(pending, ids):
+        for i, video_id in zip(targets, ids):
             iso = asr_map.get(video_id, '')
             base = iso.split('-')[0].lower()
             if base in keep:
@@ -772,9 +852,11 @@ def main(args, status_callback=print):
             calib_df['video_title'] = calib_df['video_title'].fillna('')
             calibrated = len(calib_df) >= 4 * MIN_BUCKET_N
         artifact = train(args.history, status, exclude_video_ids=exclude,
-                         calib_df=calib_df, asr_key=asr_key)
+                         calib_df=calib_df, asr_key=asr_key,
+                         asr_limit=getattr(args, 'asr_limit', ASR_DEFAULT_LIMIT))
 
-    out = predict(df, artifact, status, asr_key=asr_key)
+    out = predict(df, artifact, status, asr_key=asr_key,
+                  asr_limit=getattr(args, 'asr_limit', ASR_DEFAULT_LIMIT))
     out.to_csv(args.prediction_output, index=False)
     status(f'Saved predictions to {args.prediction_output}')
 
@@ -789,6 +871,10 @@ if __name__ == '__main__':
                         help='all_claims export with language_id (required when no cached artifact)')
     parser.add_argument('--eval-labels', default=None,
                         help='Completed monthly sheet (video_id + language_id) to score against')
+    parser.add_argument('--asr-limit', type=int, default=ASR_DEFAULT_LIMIT,
+                        help=f'max captions.list lookups per phase, tuning and prediction (default {ASR_DEFAULT_LIMIT}; '
+                             f'50 quota units each, 10,000/day shared with production). '
+                             f'Contested titles are always looked up first.')
     parser.add_argument('--asr', action='store_true',
                         help='Consult YouTube automatic captions for claims no '
                              'cheaper tier could answer (50 quota units each; '
