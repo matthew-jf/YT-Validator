@@ -438,18 +438,25 @@ def tune_asr_languages(asr_iso, iso2wess, wess_freq, truth):
         wess = asr_to_wess(iso, iso2wess, wess_freq)
         if wess is None:
             continue
-        per_lang[iso][1] += 1
-        per_lang[iso][0] += int(wess == true_lang)
+        per_lang[asr_base(iso)][1] += 1
+        per_lang[asr_base(iso)][0] += int(wess == true_lang)
     keep = {iso: round(hits / n, 4) for iso, (hits, n) in per_lang.items()
             if n >= ASR_MIN_PER_LANG and hits / n >= ASR_PRECISION}
     return keep
+
+
+def asr_base(iso_code):
+    """'es-419' -> 'es'. Tuning, the fire count and prediction must key a
+    language identically, or a region variant splits its tuning rows and a
+    language certified as 'es-419' never matches at prediction time."""
+    return str(iso_code).split('-')[0].lower()
 
 
 def asr_to_wess(iso_code, iso2wess, wess_freq):
     """ASR's BCP-47 label -> WESS id, ambiguity resolved by history frequency."""
     if not iso_code:
         return None
-    base = str(iso_code).split('-')[0].lower()
+    base = asr_base(iso_code)
     for iso in ISO1_TO_3.get(base, [base] if len(base) == 3 else []):
         if iso in iso2wess:
             return max(iso2wess[iso], key=lambda w: wess_freq.get(w, 0))
@@ -580,7 +587,7 @@ def train(history_path, status, exclude_video_ids=(), calib_df=None, asr_key=Non
         asr_map = asr_languages(looked_up, asr_key, status)
         asr_iso = [asr_map.get(v, '') for v in ids]
         keep = tune_asr_languages(asr_iso, iso2wess, wess_freq, truth)
-        fired = sum(1 for iso in asr_iso if iso.split('-')[0].lower() in keep)
+        fired = sum(1 for iso in asr_iso if asr_base(iso) in keep)
         if keep and fired >= MIN_BUCKET_N:
             tiers['ASR'] = {'languages': keep}
             status(f'  ASR: trusting {len(keep)} language(s) {sorted(keep)}, '
@@ -732,7 +739,7 @@ def predict(df, artifact, status, asr_key=None, asr_limit=ASR_DEFAULT_LIMIT):
         asr_map = asr_languages(ids, asr_key, status)
         for i, video_id in zip(targets, ids):
             iso = asr_map.get(video_id, '')
-            base = iso.split('-')[0].lower()
+            base = asr_base(iso)
             if base in keep:
                 wess = asr_to_wess(iso, iso2wess, wess_freq)
                 if wess is not None:
