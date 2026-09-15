@@ -394,35 +394,102 @@ def lid_predict(model, label_map, titles):
 # ---------------------------------------------------------------------------
 # Cutoff tuning (most permissive cutoff whose bucket stays >= PRECISION_TARGET)
 # ---------------------------------------------------------------------------
+# captions.list failures, classified by the API's reason code. The HTTP status
+# alone cannot separate them: 'forbidden' (captions not viewable) and
+# 'quotaExceeded' are both 403.
+ASR_NO_TRACK_REASONS = {'forbidden', 'videoNotFound', 'captionNotFound'}
+ASR_RETRY_REASONS = {'rateLimitExceeded', 'userRateLimitExceeded', 'servingLimitExceeded',
+                     'internalError', 'backendError', 'backendNotConnected', 'notReady'}
+ASR_STOP_REASONS = {'quotaExceeded', 'quotaExceeded402', 'dailyLimitExceeded',
+                    'dailyLimitExceeded402', 'dailyLimitExceededUnreg',
+                    'variableTermLimitExceeded', 'variableTermExpiredDailyExceeded',
+                    'concurrentLimitExceeded', 'keyInvalid', 'keyExpired', 'accessNotConfigured'}
+ASR_RETRIES = 2                   # extra attempts for a transient failure
+ASR_MAX_CONSECUTIVE_FAILURES = 5  # unrecorded failures in a row that mean an outage
+
+
+def http_error_reason(exc):
+    """The API's reason code ('quotaExceeded', 'forbidden', ...) from an HttpError.
+
+    HttpError.reason is the human-readable message, not the code, so the code is
+    read from the response body.
+    """
+    try:
+        error = json.loads(exc.content.decode('utf-8'))['error']
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return ''
+    for item in list(error.get('errors') or []) + list(error.get('details') or []):
+        if isinstance(item, dict) and item.get('reason'):
+            return item['reason']
+    return ''
+
+
 def asr_languages(video_ids, api_key, status=None):
-    """video_id -> ISO code of the video's automatic captions ('' when none).
+    """video_id -> ISO code of the video's automatic captions ('' when it has none).
 
     YouTube runs speech recognition on most uploads, and the resulting track is
     labelled with the language it heard. That is evidence about the audio, which
     is what the reviewer actually judges - unlike the title, which is often in a
     different language from the film.
 
+    Only definite answers are returned. '' means YouTube answered and there is no
+    usable track: none was generated, the captions are not viewable, or the video
+    is gone. A video whose lookup failed is left out entirely, because a failure
+    is not an answer - recording it as '' would make an exhausted quota look like
+    a video without captions, and a cache would never ask again. The run stops at
+    the first quota or key error, since every later call would fail the same way.
+
     Costs 50 quota units per video, so callers should pass only the rows no
     cheaper tier could answer.
     """
+    import time
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
 
     youtube = build('youtube', 'v3', developerKey=api_key)
-    out = {}
+    out, failed, consecutive = {}, 0, 0
     for k, video_id in enumerate(video_ids, 1):
-        try:
-            response = youtube.captions().list(part='snippet',
-                                               videoId=video_id).execute()
-            tracks = [item['snippet'] for item in response.get('items', [])]
-            asr = [t for t in tracks if t.get('trackKind') == 'asr']
-            out[video_id] = (asr[0].get('language') or '') if asr else ''
-        except HttpError as exc:
-            out[video_id] = ''
-            if status and k == 1:
-                status(f'  captions lookup failed ({exc}); ASR tier will be empty')
+        error, retryable = '', False
+        for attempt in range(ASR_RETRIES + 1):
+            try:
+                response = youtube.captions().list(part='snippet',
+                                                   videoId=video_id).execute()
+                tracks = [item['snippet'] for item in response.get('items', [])]
+                asr = [t for t in tracks if t.get('trackKind') == 'asr']
+                out[video_id] = (asr[0].get('language') or '') if asr else ''
+                break
+            except HttpError as exc:
+                reason = http_error_reason(exc)
+                if reason in ASR_NO_TRACK_REASONS:
+                    out[video_id] = ''
+                    break
+                if reason in ASR_STOP_REASONS:
+                    if status:
+                        status(f'  ASR: stopped at lookup {k} of {len(video_ids)} ({reason}); '
+                               f'{len(video_ids) - k + 1} left unrecorded')
+                    return out
+                error = reason or f'HTTP {exc.status_code}'
+                retryable = reason in ASR_RETRY_REASONS or exc.status_code >= 500
+            except Exception as exc:  # network trouble: timeouts, dropped connections
+                error, retryable = type(exc).__name__, True
+            if not retryable or attempt == ASR_RETRIES:
+                break
+            time.sleep(2 ** attempt)
+        if video_id in out:
+            consecutive = 0
+            continue
+        failed += 1
+        consecutive += 1
+        if status:
+            status(f'  ASR: {video_id} not looked up ({error}); left unrecorded')
+        if consecutive >= ASR_MAX_CONSECUTIVE_FAILURES:
+            if status:
+                status(f'  ASR: stopped after {consecutive} failures in a row; '
+                       f'{len(video_ids) - k} left unrecorded')
+            return out
+    if status and failed:
+        status(f'  ASR: {failed} of {len(video_ids)} lookups failed and were left unrecorded')
     return out
-
 
 def tune_asr_languages(asr_iso, iso2wess, wess_freq, truth):
     """Keep only the ASR languages whose mapping to WESS is reliable.
