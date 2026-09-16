@@ -184,6 +184,39 @@ the daily ingest export carries neither, and then order is views alone. 180 look
 units, leaving room for the verdict pipeline's availability checks (~48 units per
 run).
 
+The workflow across both services:
+
+```
+DAILY    evidence only, nothing decided
+  YouTube a3 report -> claims pipeline ingest (06:00 UTC) -> POST /asr/queue
+    -> data/asr_queue.csv -> collector (08:15 UTC, 180 lookups) -> data/asr_cache.jsonl
+
+MONTHLY  the decision, fed by that cache
+  Ben's verdicts -> pipeline POST /predict + language_history + language_eval_labels
+    -> certify ASR languages from the cache (zero quota) -> verdict model + language cascade
+    -> CSV back to the pipeline -> Drive -> Ben
+
+CONSOLE  browser cannot reach the VM, so the pipeline proxies
+  console -> pipeline /api/claims-ingest/status -> localhost:3001/asr/status
+```
+
+Cadence and budget live in two different places, deliberately: the **cadence** is
+the systemd timer (`OnCalendar=*-*-* 08:15:00 UTC`, after the Pacific quota
+reset), and the **budget** is `ASR_DAILY_LIMIT` (180) in `predict_wess.py`, used
+whenever `--asr-limit` is omitted. The limit is per invocation, not per calendar
+day: a manual run spends on top of the timer's. Nothing can read YouTube's
+remaining quota — the API does not expose it — so "9,000 of 10,000" is our own
+arithmetic and assumes nothing else drew on the key.
+
+Rates measured on the live queue (16 Sep 2026): claims arrive at ~110/day (107-125
+depending on the window, from `claim_created_date`). How many need a lookup depends
+on which tiers are live, because rows CHANNEL or TITLE answer are skipped. With the
+deployed artifact (CHANNEL + FASTTEXT, TITLE self-disabled on the July batch)
+99.5% need one, so ~110 lookups/day, net progress ~70/day against the 180 budget,
+and the 4,405-video backlog clears in ~63 days. With TITLE live about 90% need one:
+~99/day, ~54 days. Ben's verdicts remove claims from the queue before the collector
+reaches them, so both are pessimistic bounds.
+
 `GET /asr/status` is a cheap, pollable view for the claims console: queue rows
 and whether the export carried `licensed`/`triage`, cache split (with and without
 a caption track), the collector's last run (`looked_up`, `added`, `failed`,
