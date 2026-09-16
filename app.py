@@ -5,7 +5,7 @@ load_env(["YT_API_KEY"])
 
 from flask import Flask, request, jsonify, send_file
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 import threading
 import uuid
 import pandas as pd
@@ -143,7 +143,7 @@ def asr_status():
             header = [c.strip() for c in (handle.readline() or '').split(',')]
         state['queue'] = {
             'rows': max(0, _count_lines(queue_path) - 1),
-            'written_at': datetime.fromtimestamp(os.path.getmtime(queue_path)).isoformat(timespec='seconds'),
+            'written_at': datetime.fromtimestamp(os.path.getmtime(queue_path), tz=timezone.utc).isoformat(timespec='seconds'),
             'has_licensed': 'licensed' in header,
             'has_triage': 'triage' in header,
         }

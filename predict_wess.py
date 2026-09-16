@@ -27,7 +27,7 @@ import os
 import re
 import tempfile
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -588,7 +588,7 @@ def append_asr_cache(answers, path=None):
         return
     path = Path(path or ASR_CACHE_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().isoformat(timespec='seconds')
+    stamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
     # A crash mid-write can leave the last line without its newline. Start a new
     # line, so the torn record is the only one lost.
     torn = False
@@ -687,7 +687,7 @@ def collect_asr(df, api_key, limit, status, artifact=None, path=None, status_pat
     after = sum(1 for v in order if v in cache)
     left = len(order) - after
     write_collector_status({
-        'last_run': datetime.now().isoformat(timespec='seconds'),
+        'last_run': datetime.now(timezone.utc).isoformat(timespec='seconds'),
         'looked_up': report.get('looked_up', 0),
         'added': after - before,
         'failed': report.get('failed', 0),
@@ -905,7 +905,7 @@ def train(history_path, status, exclude_video_ids=(), calib_df=None, asr_key=Non
         'wess2name': wess2name,
         'channel_tokens': {ch: channel_tokens(ctr) for ch, ctr in counters_all.items()},
         'metadata': {
-            'trained_at': datetime.now().isoformat(timespec='seconds'),
+            'trained_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
             'history': str(history_path),
             'labeled_rows': int(len(df)),
             'languages': int(df['lang'].nunique()),
