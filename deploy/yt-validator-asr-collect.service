@@ -9,5 +9,5 @@ ConditionPathExists=/opt/yt-validator/data/asr_queue.csv
 Type=oneshot
 WorkingDirectory=/opt/yt-validator
 # Match the Python used by the yt-validator unit (systemctl cat yt-validator)
-ExecStart=/opt/miniconda3/envs/YT-Validator/bin/python predict_wess.py --collect-asr --prediction-input data/asr_queue.csv
+ExecStart=/opt/miniconda3/envs/YT-Validator/bin/python predict_wess.py --collect-asr --prediction-input data/asr_queue.csv --asr-limit 180
 Nice=10
