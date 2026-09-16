@@ -47,11 +47,22 @@ CASCADE = ['CHANNEL', 'TITLE', 'ASR', 'FASTTEXT', 'LID']
 MAX_TITLE_WORDS = 3       # longest phrase matched in a title, and indexed from a name
 ASR_MIN_PER_LANG = 25     # tuning rows an ASR language needs before it is judged
                           # (matches MIN_BUCKET_N: 5/5 passes on luck alone)
-ASR_PRECISION = 0.90      # ...and the precision it must reach to be trusted
+ASR_PRECISION = 0.95      # ...and the precision it must reach to be trusted - the same bar as
+                          # every other tier: ASR runs before FASTTEXT (~92% held out) and may
+                          # override TITLE, so a lower bar would trade accuracy for coverage
 ASR_DEFAULT_LIMIT = 100   # captions.list lookups per PHASE - tuning and prediction each get
                           # this many. 50 quota units per lookup, so a full run costs at most
                           # 2 x 100 x 50 = 10,000 units: exactly the daily key that production
                           # shares. Uncapped, tuning alone would ask for 8 days of quota.
+ASR_DAILY_LIMIT = 180     # lookups per day for the collector: 9,000 of the 10,000 units, leaving
+                          # room for the verdict pipeline's availability checks (~48 per run)
+ASR_CACHE_PATH = BASE_DIR / 'data' / 'asr_cache.jsonl'
+# fastText is reproducible only with a fixed seed AND one thread: its threads update the
+# model without locking, so with 7 threads 1 prediction in 10 changed between identical
+# runs (seed set). One thread makes retrains identical; a full retrain takes ~12 min, not ~5.
+FT_SEED = 1
+FT_THREADS = 1
+TRIAGE_PRIORITY = {'AUTO_Y': 0, 'REVIEW': 1}   # collector order; the AUTO_N* buckets come last
 
 # fastText lid.176 labels are mostly ISO 639-1; the sheets mapping uses 639-3.
 # Candidates are tried in order until one exists in the mapping.
@@ -328,9 +339,10 @@ def train_fasttext(df, counters, status):
     model = fasttext.train_supervised(
         train_file, lr=0.5, epoch=20, wordNgrams=2, minn=2, maxn=5,
         dim=64, loss='softmax', bucket=1_000_000,
-        thread=max(1, (os.cpu_count() or 4) - 1), verbose=0)
+        seed=FT_SEED, thread=FT_THREADS, verbose=0)
     try:
-        model.quantize(input=train_file, cutoff=200_000, retrain=True, qnorm=True, verbose=0)
+        model.quantize(input=train_file, cutoff=200_000, retrain=True, qnorm=True,
+                       thread=FT_THREADS, verbose=0)
     except Exception as exc:  # quantization is a size optimization only
         status(f'fastText quantization skipped ({exc})')
     os.unlink(train_file)
@@ -491,26 +503,154 @@ def asr_languages(video_ids, api_key, status=None):
         status(f'  ASR: {failed} of {len(video_ids)} lookups failed and were left unrecorded')
     return out
 
+def asr_language_report(asr_iso, iso2wess, wess_freq, truth):
+    """Per ASR language: rows, correct, precision, base rate and lift.
+
+    Base rate is how often that language is the truth among all the rows being
+    judged, whatever ASR said. Precision alone flatters a language that simply
+    dominates the batch - always answering Spanish on a batch that is a quarter
+    Spanish scores 25% for free - so lift (precision / base rate) shows how much
+    of the precision is the signal rather than the prior.
+    """
+    judged = len(truth)
+    truth_counts = Counter(truth)
+    per_lang = defaultdict(lambda: [0, 0, None])
+    for iso, true_lang in zip(asr_iso, truth):
+        wess = asr_to_wess(iso, iso2wess, wess_freq)
+        if wess is None:
+            continue
+        entry = per_lang[asr_base(iso)]
+        entry[0] += int(wess == true_lang)
+        entry[1] += 1
+        entry[2] = wess
+    report = {}
+    for code, (hits, n, wess) in per_lang.items():
+        precision = hits / n
+        base = truth_counts.get(wess, 0) / judged if judged else 0.0
+        report[code] = {'n': n, 'correct': hits, 'precision': round(precision, 4),
+                        'base_rate': round(base, 4),
+                        'lift': round(precision / base, 1) if base else None}
+    return report
+
+
 def tune_asr_languages(asr_iso, iso2wess, wess_freq, truth):
     """Keep only the ASR languages whose mapping to WESS is reliable.
 
     One ASR label often spans many WESS ids - 'id' covers Djambi, Malaysian,
     North Moluccan Malay and more - and resolving that by history frequency
     guesses wrong far more often than it guesses right. Measuring per language
-    keeps the ones where the mapping is safe (Spanish, Hindi) and drops the
-    ones where it is not, instead of judging the signal as a whole.
+    keeps the ones where the mapping is safe and drops the ones where it is not,
+    instead of judging the signal as a whole.
     """
-    per_lang = defaultdict(lambda: [0, 0])
-    for iso, true_lang in zip(asr_iso, truth):
-        wess = asr_to_wess(iso, iso2wess, wess_freq)
-        if wess is None:
-            continue
-        per_lang[asr_base(iso)][1] += 1
-        per_lang[asr_base(iso)][0] += int(wess == true_lang)
-    keep = {iso: round(hits / n, 4) for iso, (hits, n) in per_lang.items()
-            if n >= ASR_MIN_PER_LANG and hits / n >= ASR_PRECISION}
-    return keep
+    report = asr_language_report(asr_iso, iso2wess, wess_freq, truth)
+    return {code: r['precision'] for code, r in report.items()
+            if r['n'] >= ASR_MIN_PER_LANG and r['precision'] >= ASR_PRECISION}
 
+
+def load_asr_cache(path=None):
+    """video_id -> caption code for every definite answer fetched so far.
+
+    The cache is an append-only JSON-lines log. It holds what YouTube said, never
+    a judgement on it: whether a code is trusted is decided at certification, so
+    a language certified later can use answers fetched months earlier.
+    """
+    path = Path(path or ASR_CACHE_PATH)
+    cache = {}
+    if path.exists():
+        with open(path, encoding='utf-8') as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:   # a line cut short by a crash mid-write
+                    continue
+                cache[record['video_id']] = record['code']
+    return cache
+
+
+def append_asr_cache(answers, path=None):
+    """Append fetched answers to the cache log."""
+    if not answers:
+        return
+    path = Path(path or ASR_CACHE_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().isoformat(timespec='seconds')
+    # A crash mid-write can leave the last line without its newline. Start a new
+    # line, so the torn record is the only one lost.
+    torn = False
+    if path.exists() and path.stat().st_size:
+        with open(path, 'rb') as handle:
+            handle.seek(-1, os.SEEK_END)
+            torn = handle.read(1) != b'\n'
+    with open(path, 'a', encoding='utf-8') as handle:
+        if torn:
+            handle.write('\n')
+        for video_id, code in answers.items():
+            handle.write(json.dumps({'video_id': video_id, 'code': code,
+                                     'fetched_at': stamp}) + '\n')
+
+
+def fill_asr_cache(video_ids, cache, api_key=None, limit=0, status=None, path=None):
+    """Look up at most `limit` of these videos that the cache has not seen yet.
+
+    Needs an API key; without one the cache is returned as it is. The budget is
+    spent from the front, so callers pass video_ids most important first. Every
+    new answer is written to the cache, so a video is only ever paid for once.
+    """
+    missing = [v for v in dict.fromkeys(video_ids) if v and v not in cache]
+    if api_key and missing and limit > 0:
+        fetched = asr_languages(missing[:limit], api_key, status)
+        append_asr_cache(fetched, path)
+        cache.update(fetched)
+    return cache
+
+
+def asr_collection_order(df, artifact=None):
+    """Video ids of a scored queue, in the order the collector should look them up.
+
+    Rows CHANNEL or TITLE already answer are skipped - except contested titles,
+    which ASR may overrule. The rest go claims likely to be approved first
+    (AUTO_Y, then REVIEW, then the auto-rejected), most-viewed first within each:
+    a language is only used on an approved claim, and approved claims are also
+    the rows that certify languages. The auto-rejected still come last rather
+    than never, because reviewers overturn a few percent of them.
+    """
+    artifact = artifact or {}
+    tiers = artifact.get('tiers', {})
+    cmap = artifact.get('channel_map', {}) if 'CHANNEL' in tiers else {}
+    rules = ({k: tuple(v) for k, v in artifact.get('title_rules', {}).items()}
+             if 'TITLE' in tiers else {})
+    ranked = []
+    for position, row in enumerate(df.to_dict('records')):
+        channel = row.get('channel_id')
+        if isinstance(channel, str) and channel in cmap:
+            continue
+        title = row.get('video_title')
+        if rules and isinstance(title, str):
+            match = apply_title_rules(title, rules)
+            if match and not match[2]:
+                continue
+        views = pandas.to_numeric(row.get('views'), errors='coerce')
+        ranked.append((TRIAGE_PRIORITY.get(row.get('triage'), 2),
+                       -(0.0 if pandas.isna(views) else float(views)),
+                       position, normalize_id(row.get('video_id'))))
+    return list(dict.fromkeys(video_id for *_, video_id in sorted(ranked) if video_id))
+
+
+def collect_asr(df, api_key, limit, status, artifact=None, path=None):
+    """One day of collection: look up the next `limit` uncached videos of a queue."""
+    order = asr_collection_order(df, artifact)
+    cache = load_asr_cache(path)
+    before = sum(1 for v in order if v in cache)
+    fill_asr_cache(order, cache, api_key, limit, status, path)
+    after = sum(1 for v in order if v in cache)
+    left = len(order) - after
+    status(f'ASR collector: {after - before} answers added; {after} of {len(order)} queue '
+           f'videos needing ASR are cached, {left} to go'
+           + (f' (~{-(-left // limit)} more day(s) at {limit}/day)' if left and limit else ''))
+    return after - before
 
 def asr_base(iso_code):
     """'es-419' -> 'es'. Tuning, the fire count and prediction must key a
@@ -643,27 +783,32 @@ def train(history_path, status, exclude_video_ids=(), calib_df=None, asr_key=Non
                                        f'rows (best: {last_title_prec:.3f} on {last_title_n})',
                              'val_precision': round(last_title_prec, 4), 'val_n': last_title_n}
 
-    # ---- ASR: trust the audio, but only for languages whose mapping is safe
-    if asr_key:
-        # Budgeted like the prediction pass: an uncapped tuning half would ask
-        # for several days of quota and exhaust the key production shares.
-        ids = [normalize_id(v) for v in tune_df['video_id']]
-        looked_up = ids[:asr_limit]
-        status(f'  ASR: fetching caption languages for {len(looked_up)} of {len(ids)} '
-               f'tuning rows = {len(looked_up) * 50:,} quota units')
-        asr_map = asr_languages(looked_up, asr_key, status)
-        asr_iso = [asr_map.get(v, '') for v in ids]
+    # ---- ASR: trust the audio, but only for languages whose mapping is safe.
+    # Certification reads the caption cache the collector fills during the month,
+    # so it spends no quota. With --asr it may also look up uncached tuning rows,
+    # within --asr-limit.
+    asr_cache = load_asr_cache()
+    ids = [normalize_id(v) for v in tune_df['video_id']]
+    if asr_key or any(v in asr_cache for v in ids):
+        fill_asr_cache(ids, asr_cache, asr_key, asr_limit, status)
+        cached = sum(1 for v in ids if v in asr_cache)
+        status(f'  ASR: {cached} of {len(ids)} tuning rows have a cached caption lookup')
+        asr_iso = [asr_cache.get(v, '') for v in ids]
+        report = asr_language_report(asr_iso, iso2wess, wess_freq, truth)
+        for code, r in sorted(report.items(), key=lambda kv: -kv[1]['n'])[:8]:
+            status(f'    {code}: {r["correct"]}/{r["n"]} = {r["precision"]:.3f}, '
+                   f'base rate {r["base_rate"]:.3f}, lift {r["lift"]}')
         keep = tune_asr_languages(asr_iso, iso2wess, wess_freq, truth)
         fired = sum(1 for iso in asr_iso if asr_base(iso) in keep)
         if keep and fired >= MIN_BUCKET_N:
-            tiers['ASR'] = {'languages': keep}
+            tiers['ASR'] = {'languages': keep, 'report': report}
             status(f'  ASR: trusting {len(keep)} language(s) {sorted(keep)}, '
                    f'fires on {fired} of {len(tune_df)}')
         else:
             disabled['ASR'] = {'reason': f'no ISO code reached {ASR_MIN_PER_LANG} rows at '
-                                         f'{ASR_PRECISION} precision (looked up {len(looked_up)} '
-                                         f'of {len(ids)} tuning rows)',
-                               'val_n': fired}
+                                         f'{ASR_PRECISION} precision ({cached} of {len(ids)} '
+                                         f'tuning rows cached)',
+                               'val_n': fired, 'report': report}
             status(f'  ASR: no language met {ASR_PRECISION} on >= {ASR_MIN_PER_LANG} '
                    f'rows (or too few fires); tier disabled')
 
@@ -785,27 +930,23 @@ def predict(df, artifact, status, asr_key=None, asr_limit=ASR_DEFAULT_LIMIT):
 
     pending = [i for i in range(n) if source[i] == 'REVIEW']
     # ASR arbitrates the handful of titles that named several languages, and
-    # otherwise answers rows no cheaper tier could. Contested titles come first
-    # because they are few and high-value; the unanswered tail is whatever the
-    # quota budget still allows. captions.list costs 50 units and cannot be
-    # batched, so an unbounded run would ask for many times the daily key and
-    # exhaust the availability lookups production depends on.
+    # otherwise answers rows no cheaper tier could. Answers come from the caption
+    # cache the collector fills; --asr only adds live lookups for rows it has not
+    # reached, within --asr-limit, contested titles first.
     targets = contested + pending
-    if 'ASR' in tiers and targets and asr_key:
-        skipped = max(0, len(targets) - asr_limit)
-        targets = targets[:asr_limit]
+    if 'ASR' in tiers and targets:
         keep = tiers['ASR']['languages']
         iso2wess = artifact['iso2wess']
         wess_freq = artifact['wess_freq']
         ids = [normalize_id(df['video_id'].iloc[i]) for i in targets]
-        status(f'  ASR: {len(targets)} lookups ({len(contested)} contested titles first, '
-               f'then unanswered claims) = {len(targets) * 50:,} quota units')
-        if skipped:
-            status(f'  ASR: {skipped:,} rows left for REVIEW - budget --asr-limit is '
-                   f'{asr_limit}; raising it costs 50 units each')
-        asr_map = asr_languages(ids, asr_key, status)
+        asr_cache = load_asr_cache()
+        cached_before = sum(1 for v in ids if v in asr_cache)
+        fill_asr_cache(ids, asr_cache, asr_key, asr_limit, status)
+        cached = sum(1 for v in ids if v in asr_cache)
+        status(f'  ASR: {cached} of {len(ids)} rows have a caption lookup '
+               f'({cached_before} cached, {cached - cached_before} looked up now)')
         for i, video_id in zip(targets, ids):
-            iso = asr_map.get(video_id, '')
+            iso = asr_cache.get(video_id, '')
             base = asr_base(iso)
             if base in keep:
                 wess = asr_to_wess(iso, iso2wess, wess_freq)
@@ -850,10 +991,83 @@ def predict(df, artifact, status, asr_key=None, asr_limit=ASR_DEFAULT_LIMIT):
 # ---------------------------------------------------------------------------
 # Evaluation against a completed monthly sheet
 # ---------------------------------------------------------------------------
-def read_labels(labels_path):
-    labels = pandas.read_csv(labels_path, usecols=['video_id', 'language_id'], dtype=str)
+def label_paths(value):
+    """One or more reviewed verdict sheets -> list of paths.
+
+    Accepts a path, a comma-separated string of paths, or a list of either: the
+    monthly review arrives as two sheets (MCN and JFM).
+    """
+    if not value:
+        return []
+    items = value if isinstance(value, (list, tuple)) else [value]
+    return [part.strip() for item in items for part in str(item).split(',') if part.strip()]
+
+
+def read_verdict_sheet(path):
+    """One raw reviewed verdict sheet: video_id and language_id only, headers stripped.
+
+    Built for the files the claims pipeline uploads as-is: columns are found by
+    name in any order, header names are stripped (a July sheet has ' wave'),
+    trailing empty columns and malformed rows are ignored, and the path needn't
+    end in .csv.
+    """
+    sheet = pandas.read_csv(path, dtype=str, encoding='utf-8-sig', on_bad_lines='skip',
+                            usecols=lambda column: str(column).strip() in ('video_id', 'language_id'))
+    sheet.columns = [str(column).strip() for column in sheet.columns]
+    return sheet
+
+
+def read_labels(labels_path, status=None):
+    """video_id -> WESS language from one or more reviewed verdict sheets.
+
+    A sheet without video_id or language_id contributes no labels rather than an
+    error. Rows without a language (no verdict, or not approved) are dropped.
+    """
+    frames = []
+    for path in label_paths(labels_path):
+        sheet = read_verdict_sheet(path)
+        if not {'video_id', 'language_id'} <= set(sheet.columns):
+            if status:
+                status(f'  labels: {Path(path).name} has no video_id/language_id columns - skipped')
+            continue
+        frames.append(sheet[['video_id', 'language_id']])
+    if not frames:
+        return pandas.DataFrame(columns=['video_id', 'true_lang'])
+    labels = pandas.concat(frames, ignore_index=True)
     labels['true_lang'] = labels['language_id'].map(norm_lang)
-    return labels[labels['true_lang'].notna()][['video_id', 'true_lang']]
+    labels = labels[labels['true_lang'].notna() & labels['video_id'].notna()]
+    return labels.drop_duplicates('video_id', keep='last')[['video_id', 'true_lang']]
+
+def train_from_exports(history_path, eval_labels, status):
+    """Monthly retrain from the claims pipeline's own exports.
+
+    history_path is the run's all_claims.csv and eval_labels the reviewed verdict
+    sheet(s). Tuning rows take their titles and channels from all_claims, not from
+    the queue about to be predicted: the reviewed batch and the new queue barely
+    overlap (~2% of videos), so joining the labels onto the queue would leave
+    almost nothing to tune on. ASR is certified from the caption cache, with no
+    API calls.
+    """
+    import csv
+    import sys
+    labels = read_labels(eval_labels, status)
+    if labels.empty:
+        raise ValueError('no reviewed claims with a language in the verdict sheets')
+    wanted = {normalize_id(v): lang for v, lang in zip(labels['video_id'], labels['true_lang'])}
+    csv.field_size_limit(sys.maxsize)
+    rows, seen = [], set()
+    with open(history_path, newline='', encoding='utf-8', errors='replace') as handle:
+        for row in csv.DictReader(handle):
+            video_id = normalize_id(row.get('video_id') or '')
+            if video_id in wanted and video_id not in seen:
+                seen.add(video_id)
+                rows.append({'video_id': video_id, 'video_title': row.get('video_title') or '',
+                             'channel_id': row.get('channel_id') or '', 'lang': wanted[video_id]})
+    calib_df = pandas.DataFrame(rows, columns=['video_id', 'video_title', 'channel_id', 'lang'])
+    status(f'Retraining languages: {len(calib_df):,} of {len(wanted):,} reviewed claims found in '
+           f'{Path(history_path).name} ({100 * len(calib_df) / max(len(wanted), 1):.1f}%)')
+    exclude = tuple(set(labels['video_id']) | set(wanted))
+    return train(history_path, status, exclude_video_ids=exclude, calib_df=calib_df)
 
 
 def report(merged, status):
@@ -897,8 +1111,21 @@ def evaluate(out_df, labels_path, status, calibrated=False):
 def main(args, status_callback=print):
     status = status_callback
 
-    # The ASR tier reads YouTube's automatic captions, which costs 50 quota
-    # units per video, so it is opt-in. Everything else runs offline.
+    asr_limit = getattr(args, 'asr_limit', None)
+    if getattr(args, 'collect_asr', False):
+        # Collector mode: one day of caption lookups for a scored queue, then exit.
+        from helpers import load_env
+        load_env(['YT_API_KEY'])
+        queue = pandas.read_csv(args.prediction_input, low_memory=False)
+        artifact = load_artifact() if ARTIFACT_PATH.exists() else None
+        collect_asr(queue, os.environ['YT_API_KEY'],
+                    ASR_DAILY_LIMIT if asr_limit is None else asr_limit, status, artifact)
+        return
+    if asr_limit is None:
+        asr_limit = ASR_DEFAULT_LIMIT
+
+    # Live caption lookups cost 50 quota units per video, so they are opt-in.
+    # Without --asr the ASR tier still answers from the collector's cache.
     asr_key = None
     if getattr(args, 'asr', False):
         from helpers import load_env
@@ -909,8 +1136,9 @@ def main(args, status_callback=print):
 
     exclude = ()
     if args.eval_labels:  # keep evaluation honest if history already has these
-        exclude = tuple(pandas.read_csv(args.eval_labels, usecols=['video_id'],
-                                        dtype=str)['video_id'].dropna())
+        exclude = tuple(pandas.concat(
+            [read_verdict_sheet(path).get('video_id', pandas.Series(dtype=str))
+             for path in label_paths(args.eval_labels)]).dropna())
 
     calibrated = False
     if ARTIFACT_PATH.exists():
@@ -927,10 +1155,10 @@ def main(args, status_callback=print):
             calibrated = len(calib_df) >= 4 * MIN_BUCKET_N
         artifact = train(args.history, status, exclude_video_ids=exclude,
                          calib_df=calib_df, asr_key=asr_key,
-                         asr_limit=getattr(args, 'asr_limit', ASR_DEFAULT_LIMIT))
+                         asr_limit=asr_limit)
 
     out = predict(df, artifact, status, asr_key=asr_key,
-                  asr_limit=getattr(args, 'asr_limit', ASR_DEFAULT_LIMIT))
+                  asr_limit=asr_limit)
     out.to_csv(args.prediction_output, index=False)
     status(f'Saved predictions to {args.prediction_output}')
 
@@ -945,14 +1173,17 @@ if __name__ == '__main__':
                         help='all_claims export with language_id (required when no cached artifact)')
     parser.add_argument('--eval-labels', default=None,
                         help='Completed monthly sheet (video_id + language_id) to score against')
-    parser.add_argument('--asr-limit', type=int, default=ASR_DEFAULT_LIMIT,
-                        help=f'max captions.list lookups per phase, tuning and prediction (default {ASR_DEFAULT_LIMIT}; '
-                             f'50 quota units each, 10,000/day shared with production). '
-                             f'Contested titles are always looked up first.')
+    parser.add_argument('--asr-limit', type=int, default=None,
+                        help=f'Live captions.list lookups: per phase (tuning, prediction) with --asr, '
+                             f'default {ASR_DEFAULT_LIMIT}; per run with --collect-asr, default '
+                             f'{ASR_DAILY_LIMIT}. 50 quota units each, 10,000/day shared with production.')
     parser.add_argument('--asr', action='store_true',
-                        help='Consult YouTube automatic captions for claims no '
-                             'cheaper tier could answer (50 quota units each; '
-                             'needs YT_API_KEY)')
+                        help='Also make live caption lookups for rows the cache lacks (50 quota '
+                             'units each; needs YT_API_KEY). Without it, ASR answers from the cache only.')
+    parser.add_argument('--collect-asr', action='store_true',
+                        help='Collector mode: look up the next --asr-limit uncached videos of '
+                             '--prediction-input (a scored queue, ideally with triage and views) into '
+                             'data/asr_cache.jsonl, then exit. Run once a day. Needs YT_API_KEY.')
     parser.add_argument('--prediction-output',
                         default=f'wess_predictions_{datetime.now().strftime("%Y%m%d%H%M")}.csv',
                         help='Output CSV')
