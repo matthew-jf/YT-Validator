@@ -330,11 +330,37 @@ def get_youtube_client():
     return build('youtube', 'v3', developerKey=os.environ['YT_API_KEY'])
 
 
-def check_videos_available_batch(video_ids, youtube_client, check_stopped=None):
+def normalize_video_id(value):
+    """Strip the apostrophe Excel adds to ids that begin with '-'."""
+    return str(value).strip().lstrip("'")
+
+
+def _lookup_ids(youtube_client, ids, retries):
+    """Ask YouTube which of these ids exist. None means the call kept failing."""
+    import time
+    for attempt in range(retries + 1):
+        try:
+            response = youtube_client.videos().list(part='id',
+                                                    id=','.join(ids)).execute()
+            return {item['id'] for item in response.get('items', [])}
+        except Exception as exc:
+            if attempt < retries:
+                time.sleep(2 ** attempt)
+            else:
+                print(f'Availability lookup failed for {len(ids)} id(s): {exc}')
+    return None
+
+
+OUTAGE_GIVE_UP = 3   # consecutive single-id failures that mean "not one bad id"
+
+
+def check_videos_available_batch(video_ids, youtube_client, check_stopped=None,
+                                 retries=2):
     """
-    Check video availability in batches of 50 (API limit)
-    Mark entire batch as unavailable on error
-    Returns dict mapping video_id -> availability (True/False)
+    Check video availability in batches of 50 (API limit).
+    Returns dict mapping video_id -> True (present) / False (missing) / None
+    (could not be determined). Callers must treat None as unknown, never as
+    unavailable: a failed lookup is not evidence about the video.
     """
     from tqdm import tqdm
 
@@ -347,25 +373,34 @@ def check_videos_available_batch(video_ids, youtube_client, check_stopped=None):
         if check_stopped:
             check_stopped(msg)
         batch = video_ids[i:i + batch_size]
+        lookup = {normalize_video_id(v): v for v in batch}
 
-        try:
-            request = youtube_client.videos().list(part='id', id=','.join(batch))
-            response = request.execute()
-            found_ids = {item['id'] for item in response.get('items', [])}
+        found = _lookup_ids(youtube_client, list(lookup), retries)
+        if found is not None:
+            for clean, original in lookup.items():
+                results[original] = clean in found
+            continue
 
-            for video_id in batch:
-                results[video_id] = video_id in found_ids
-
-        except Exception:
-            for video_id in batch:
-                results[video_id] = False
+        # The batch call kept failing. Retry the ids one at a time so a single
+        # unacceptable id cannot condemn the other 49 to review; give up once
+        # several in a row fail, which means the API is down rather than an id
+        # being bad, and leave the rest unknown.
+        consecutive_failures = 0
+        for clean, original in lookup.items():
+            if consecutive_failures >= OUTAGE_GIVE_UP:
+                results[original] = None
+                continue
+            one = _lookup_ids(youtube_client, [clean], retries=0)
+            if one is None:
+                consecutive_failures += 1
+                results[original] = None
+            else:
+                consecutive_failures = 0
+                results[original] = clean in one
 
     return results
 
 
-# ---------------------------------------------------------------------------
-# Main pipeline
-# ---------------------------------------------------------------------------
 def main(args, status_callback=None, stop_check=None):
 
     def check_stopped(stage=''):
@@ -420,10 +455,10 @@ def main(args, status_callback=None, stop_check=None):
     # unavailable). If the input already carries a video_available column, it
     # is reused and the YouTube API is not called.
     if 'video_available' in df.columns:
-        df['video_available'] = (
-            df['video_available'].map({True: True, False: False,
-                                       'True': True, 'False': False})
-            .fillna(True).astype(bool))
+        # NaN stays NaN: an unknown availability must not become "available"
+        # any more than it may become "unavailable".
+        df['video_available'] = df['video_available'].map(
+            {True: True, False: False, 'True': True, 'False': False})
     elif 'video_id' in df.columns:
         msg = 'Checking video availability'
         check_stopped(msg)
@@ -447,7 +482,10 @@ def main(args, status_callback=None, stop_check=None):
     proba = model.predict_proba(features[FEATURES])[:, 1]
 
     licensed = df['licensed'].to_numpy(dtype=bool)
-    unavailable = ~df['video_available'].to_numpy(dtype=bool)
+    # Only an explicit False rejects. Unknown (the availability check errored)
+    # is not evidence the video is gone, so those rows go to a person instead.
+    unavailable = (df['video_available'] == False).to_numpy()       # noqa: E712
+    unknown_availability = df['video_available'].isna().to_numpy()
     forced_n = licensed | unavailable
 
     # rating stays the model probability, zeroed by rules (existing contract)
@@ -455,8 +493,9 @@ def main(args, status_callback=None, stop_check=None):
     df['predicted_verdict'] = np.where(~forced_n & (proba >= threshold), 'Y', 'N')
     df['confidence'] = np.maximum(proba, 1 - proba).round(4)
     df['triage'] = np.select(
-        [licensed, unavailable, proba <= t_low, proba >= t_high],
-        ['AUTO_N_LICENSED', 'AUTO_N_UNAVAILABLE', 'AUTO_N', 'AUTO_Y'],
+        [licensed, unavailable, unknown_availability,
+         proba <= t_low, proba >= t_high],
+        ['AUTO_N_LICENSED', 'AUTO_N_UNAVAILABLE', 'REVIEW', 'AUTO_N', 'AUTO_Y'],
         default='REVIEW')
 
     # Channel-history triage assist. A unanimous channel history alone is too

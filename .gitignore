@@ -8,6 +8,7 @@ data/
 !Licensed.csv
 !assets_single_media_component.csv
 !channel_verdicts.csv
+!sheets_language_families.csv
 
 .env*
 !.env.example
