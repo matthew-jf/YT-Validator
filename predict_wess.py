@@ -57,12 +57,14 @@ ASR_DEFAULT_LIMIT = 100   # captions.list lookups per PHASE - tuning and predict
 ASR_DAILY_LIMIT = 180     # lookups per day for the collector: 9,000 of the 10,000 units, leaving
                           # room for the verdict pipeline's availability checks (~48 per run)
 ASR_CACHE_PATH = BASE_DIR / 'data' / 'asr_cache.jsonl'
+ASR_STATUS_PATH = BASE_DIR / 'data' / 'asr_collector_status.json'
 # fastText is reproducible only with a fixed seed AND one thread: its threads update the
 # model without locking, so with 7 threads 1 prediction in 10 changed between identical
 # runs (seed set). One thread makes retrains identical; a full retrain takes ~12 min, not ~5.
 FT_SEED = 1
 FT_THREADS = 1
-TRIAGE_PRIORITY = {'AUTO_Y': 0, 'REVIEW': 1}   # collector order; the AUTO_N* buckets come last
+TRIAGE_PRIORITY = {'AUTO_Y': 0, 'REVIEW': 1}   # then rows with no triage, then the near-certain N
+TRUTHY = {'true', '1', 'yes', 't', 'y'}
 
 # fastText lid.176 labels are mostly ISO 639-1; the sheets mapping uses 639-3.
 # Candidates are tried in order until one exists in the mapping.
@@ -436,7 +438,7 @@ def http_error_reason(exc):
     return ''
 
 
-def asr_languages(video_ids, api_key, status=None):
+def asr_languages(video_ids, api_key, status=None, report=None):
     """video_id -> ISO code of the video's automatic captions ('' when it has none).
 
     YouTube runs speech recognition on most uploads, and the resulting track is
@@ -452,15 +454,25 @@ def asr_languages(video_ids, api_key, status=None):
     the first quota or key error, since every later call would fail the same way.
 
     Costs 50 quota units per video, so callers should pass only the rows no
-    cheaper tier could answer.
+    cheaper tier could answer. Pass a dict as `report` to learn how the run ended:
+    looked_up, answered, failed and stopped (None, 'quota' or 'outage').
     """
     import time
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
 
     youtube = build('youtube', 'v3', developerKey=api_key)
-    out, failed, consecutive = {}, 0, 0
+    out, failed, consecutive, attempted = {}, 0, 0, 0
+    tally = {} if report is None else report
+    tally.update({'looked_up': 0, 'answered': 0, 'failed': 0, 'stopped': None, 'reason': ''})
+
+    def finish(stopped=None, reason=''):
+        tally.update({'looked_up': attempted, 'answered': len(out), 'failed': failed,
+                      'stopped': stopped, 'reason': reason})
+        return out
+
     for k, video_id in enumerate(video_ids, 1):
+        attempted = k
         error, retryable = '', False
         for attempt in range(ASR_RETRIES + 1):
             try:
@@ -479,7 +491,7 @@ def asr_languages(video_ids, api_key, status=None):
                     if status:
                         status(f'  ASR: stopped at lookup {k} of {len(video_ids)} ({reason}); '
                                f'{len(video_ids) - k + 1} left unrecorded')
-                    return out
+                    return finish('quota', reason)
                 error = reason or f'HTTP {exc.status_code}'
                 retryable = reason in ASR_RETRY_REASONS or exc.status_code >= 500
             except Exception as exc:  # network trouble: timeouts, dropped connections
@@ -498,10 +510,10 @@ def asr_languages(video_ids, api_key, status=None):
             if status:
                 status(f'  ASR: stopped after {consecutive} failures in a row; '
                        f'{len(video_ids) - k} left unrecorded')
-            return out
+            return finish('outage', error)
     if status and failed:
         status(f'  ASR: {failed} of {len(video_ids)} lookups failed and were left unrecorded')
-    return out
+    return finish()
 
 def asr_language_report(asr_iso, iso2wess, wess_freq, truth):
     """Per ASR language: rows, correct, precision, base rate and lift.
@@ -592,7 +604,7 @@ def append_asr_cache(answers, path=None):
                                      'fetched_at': stamp}) + '\n')
 
 
-def fill_asr_cache(video_ids, cache, api_key=None, limit=0, status=None, path=None):
+def fill_asr_cache(video_ids, cache, api_key=None, limit=0, status=None, path=None, report=None):
     """Look up at most `limit` of these videos that the cache has not seen yet.
 
     Needs an API key; without one the cache is returned as it is. The budget is
@@ -601,10 +613,24 @@ def fill_asr_cache(video_ids, cache, api_key=None, limit=0, status=None, path=No
     """
     missing = [v for v in dict.fromkeys(video_ids) if v and v not in cache]
     if api_key and missing and limit > 0:
-        fetched = asr_languages(missing[:limit], api_key, status)
+        fetched = asr_languages(missing[:limit], api_key, status, report)
         append_asr_cache(fetched, path)
         cache.update(fetched)
     return cache
+
+
+def collection_rank(triage, licensed):
+    """Lower sorts first: approved, then to review, then no triage, then near-certain N.
+
+    A licensed asset is force-rejected by the verdict model, and a rejected claim
+    never needs a language - but these go last, not never: reviewers approved 3.1%
+    of the licensed bucket in July, and an approved claim does need one. Rows with
+    no triage at all (the daily ingest export carries none) sort ahead of the
+    auto-rejected, because an unknown row is likelier to need an answer.
+    """
+    if licensed or str(triage or '').startswith('AUTO_N'):
+        return 3
+    return TRIAGE_PRIORITY.get(triage, 2)
 
 
 def asr_collection_order(df, artifact=None):
@@ -614,8 +640,10 @@ def asr_collection_order(df, artifact=None):
     which ASR may overrule. The rest go claims likely to be approved first
     (AUTO_Y, then REVIEW, then the auto-rejected), most-viewed first within each:
     a language is only used on an approved claim, and approved claims are also
-    the rows that certify languages. The auto-rejected still come last rather
-    than never, because reviewers overturn a few percent of them.
+    the rows that certify languages. The auto-rejected and licensed rows still
+    come last rather than never, because reviewers overturn a few percent of them.
+    Both `triage` and `licensed` are optional: the daily ingest export carries
+    neither, and then everything sorts on views alone.
     """
     artifact = artifact or {}
     tiers = artifact.get('tiers', {})
@@ -632,21 +660,43 @@ def asr_collection_order(df, artifact=None):
             match = apply_title_rules(title, rules)
             if match and not match[2]:
                 continue
+        licensed = str(row.get('licensed', '')).strip().lower() in TRUTHY
         views = pandas.to_numeric(row.get('views'), errors='coerce')
-        ranked.append((TRIAGE_PRIORITY.get(row.get('triage'), 2),
+        ranked.append((collection_rank(row.get('triage'), licensed),
                        -(0.0 if pandas.isna(views) else float(views)),
                        position, normalize_id(row.get('video_id'))))
     return list(dict.fromkeys(video_id for *_, video_id in sorted(ranked) if video_id))
 
 
-def collect_asr(df, api_key, limit, status, artifact=None, path=None):
+def write_collector_status(payload, path=None):
+    """Write the collector's last-run summary, atomically so a poller never reads half."""
+    path = Path(path or ASR_STATUS_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    tmp.write_text(json.dumps(payload, indent=1))
+    os.replace(tmp, path)
+
+
+def collect_asr(df, api_key, limit, status, artifact=None, path=None, status_path=None):
     """One day of collection: look up the next `limit` uncached videos of a queue."""
     order = asr_collection_order(df, artifact)
     cache = load_asr_cache(path)
     before = sum(1 for v in order if v in cache)
-    fill_asr_cache(order, cache, api_key, limit, status, path)
+    report = {}
+    fill_asr_cache(order, cache, api_key, limit, status, path, report)
     after = sum(1 for v in order if v in cache)
     left = len(order) - after
+    write_collector_status({
+        'last_run': datetime.now().isoformat(timespec='seconds'),
+        'looked_up': report.get('looked_up', 0),
+        'added': after - before,
+        'failed': report.get('failed', 0),
+        'remaining': left,
+        'queue_videos_needing_asr': len(order),
+        'budget': limit,
+        'stopped_reason': report.get('stopped'),
+        'stopped_detail': report.get('reason', ''),
+    }, status_path)
     status(f'ASR collector: {after - before} answers added; {after} of {len(order)} queue '
            f'videos needing ASR are cached, {left} to go'
            + (f' (~{-(-left // limit)} more day(s) at {limit}/day)' if left and limit else ''))
