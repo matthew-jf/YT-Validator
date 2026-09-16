@@ -5,6 +5,7 @@ load_env(["YT_API_KEY"])
 
 from flask import Flask, request, jsonify, send_file
 import json
+from collections import Counter
 from datetime import datetime, timezone
 import threading
 import uuid
@@ -152,8 +153,12 @@ def asr_status():
     if os.path.exists(cache_path):
         cache = predict_wess.load_asr_cache(cache_path)
         with_track = sum(1 for code in cache.values() if code)
+        # Per-language video counts, by base code (es-419 counts as es) - the same
+        # grouping certification uses. "" is left out: it is already no_track.
+        languages = Counter(predict_wess.asr_base(code) for code in cache.values() if code)
         state['cache'] = {'videos': len(cache), 'with_track': with_track,
-                          'no_track': len(cache) - with_track}
+                          'no_track': len(cache) - with_track,
+                          'languages': dict(languages.most_common())}
 
     status_path = predict_wess.ASR_STATUS_PATH
     if os.path.exists(status_path):
