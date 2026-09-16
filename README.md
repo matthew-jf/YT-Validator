@@ -178,9 +178,20 @@ python predict_wess.py --collect-asr --prediction-input data/asr_queue.csv   # 1
 
 It skips rows CHANNEL or TITLE already answer (except contested titles) and
 anything cached, then looks up likely approvals first — `AUTO_Y`, then `REVIEW`,
-then the auto-rejected — most-viewed first within each. 180 lookups is 9,000
+then rows with no triage, then the near-certain N (`AUTO_N*` or a `licensed`
+asset) — most-viewed first within each. `triage` and `licensed` are optional:
+the daily ingest export carries neither, and then order is views alone. 180 lookups is 9,000
 units, leaving room for the verdict pipeline's availability checks (~48 units per
 run).
+
+`GET /asr/status` is a cheap, pollable view for the claims console: queue rows
+and whether the export carried `licensed`/`triage`, cache split (with and without
+a caption track), the collector's last run (`looked_up`, `added`, `failed`,
+`remaining`, `budget`, `stopped_reason` — `null`, `quota` or `outage`), live tiers
+and trusted ASR languages, and branch/commit. It reads files only — line counts,
+the collector's status JSON and the artifact re-parsed only when it changes — so
+polling stays cheap as the cache grows. `remaining` is as of the last collector
+run, not recomputed per request.
 
 Monthly cycle: when the reviewed batch comes back, retrain with it as
 `--eval-labels`. ASR certification reads the cache for the tuning half, and the
