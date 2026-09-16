@@ -110,22 +110,22 @@ cutoff, calibrated to >= 95% precision, is met; everything else is `REVIEW`:
    tie ("Creole French Haitian" -> Haitian, not French)
 3. `FASTTEXT` — supervised fastText classifier over channel-prior tokens
    (channel's top historical languages, leave-one-out at fit time) + title text
-3b. `ASR` — YouTube's automatic captions for the video, ISO -> WESS. Opt-in
-   (`--asr`), because it costs 50 quota units per video, cannot be batched, and
-   shares the 10,000/day key with production. It is consulted for two kinds of
-   row: **contested titles** (the title named several languages, so the TITLE
-   tiebreak had to choose — ASR may override its answer) and then claims no
-   cheaper tier answered. Contested titles are looked up first because they are
-   few and high-value; `--asr-limit` (default 200 = the whole daily key) caps the
-   rest, and anything past the budget stays at REVIEW. Left uncapped, a month
-   batch asks for ~133,000 units, 13x the daily allowance — which would exhaust
-   the availability lookups the production pipeline depends on. Trusted
-   **per language**: one ASR label
-   often spans many WESS ids (`id` covers Djambi, Malaysian, North Moluccan
-   Malay...), so tuning measures each language separately and keeps only those
-   reaching `ASR_PRECISION` (0.90) on at least `ASR_MIN_PER_LANG` (25) rows. Measured on a
-   300-row July sample: Spanish 32/32, Hindi 33/36, English 13/17,
-   Indonesian 5/51 — so `es`/`hi` are kept and `en`/`id` dropped.
+3b. `ASR` — YouTube's automatic captions for the video, ISO -> WESS. A lookup
+   costs 50 quota units, cannot be batched, and shares the 10,000/day key with
+   production, so lookups are made by a daily collector and kept in a cache
+   (see *Caption cache and daily collector*); training and prediction read the
+   cache and spend nothing. ASR answers two kinds of row: **contested titles**
+   (the title named several languages and the TITLE tiebreak had to choose — ASR
+   may override it) and claims no cheaper tier answered. It is trusted **per
+   language**: one ASR label often spans many WESS ids (`id` covers Djambi,
+   Malaysian, North Moluccan Malay...), so certification measures each language
+   separately — grouped by base code, `es-419` counts as `es` — and trusts only
+   those reaching `ASR_PRECISION` on at least `ASR_MIN_PER_LANG` (25) rows. The
+   training log also shows each language's base rate and lift, so a language that
+   merely dominates the batch is visible. A failed lookup is never cached as "no
+   captions", and a quota or key error stops the run. Measured on 150 fresh
+   July held-out lookups (Sept 2026): 81% returned a track; `es` 27/27, `hi`
+   20/22, `en` 10/11, `id` 4/41.
 4. `LID` — pretrained lid.176 language ID on the title, ISO -> WESS via the
    sheets mapping, ambiguous codes resolved by history frequency
 
@@ -158,8 +158,44 @@ Output CSV = input columns plus:
 
 - `predicted_language_id` — WESS number, empty when routed to review
 - `predicted_language_name` — Anglicized name from the sheets mapping
-- `language_source` — `CHANNEL` / `TITLE` / `FASTTEXT` / `LID` / `REVIEW`
+- `language_source` — `CHANNEL` / `TITLE` / `ASR` / `FASTTEXT` / `LID` / `REVIEW`
 - `language_confidence` — 1.0 for exact-rule tiers, model probability otherwise
+
+### Caption cache and daily collector
+
+`data/asr_cache.jsonl` is an append-only log of every answered caption lookup:
+`video_id`, the ASR language code (`''` when the video has no usable track) and
+when it was fetched. It records what YouTube said, never whether to trust it, so
+a language certified later can use answers fetched earlier.
+
+Each `/predict` call writes its scored batch to `data/asr_queue.csv` and adds the
+language columns above to the output (best effort: a language error never fails
+the verdict run). The collector works through that batch once a day:
+
+```shell
+python predict_wess.py --collect-asr --prediction-input data/asr_queue.csv   # 180 lookups by default
+```
+
+It skips rows CHANNEL or TITLE already answer (except contested titles) and
+anything cached, then looks up likely approvals first — `AUTO_Y`, then `REVIEW`,
+then rows with no triage, then the near-certain N (`AUTO_N*` or a `licensed`
+asset) — most-viewed first within each. `triage` and `licensed` are optional:
+the daily ingest export carries neither, and then order is views alone. 180 lookups is 9,000
+units, leaving room for the verdict pipeline's availability checks (~48 units per
+run).
+
+`GET /asr/status` is a cheap, pollable view for the claims console: queue rows
+and whether the export carried `licensed`/`triage`, cache split (with and without
+a caption track), the collector's last run (`looked_up`, `added`, `failed`,
+`remaining`, `budget`, `stopped_reason` — `null`, `quota` or `outage`), live tiers
+and trusted ASR languages, and branch/commit. It reads files only — line counts,
+the collector's status JSON and the artifact re-parsed only when it changes — so
+polling stays cheap as the cache grows. `remaining` is as of the last collector
+run, not recomputed per request.
+
+Monthly cycle: when the reviewed batch comes back, retrain with it as
+`--eval-labels`. ASR certification reads the cache for the tuning half, and the
+other half grades it.
 
 `lid.176.ftz` is downloaded automatically on first use. fastText comes from
 pip (see `environment.yml`); on macOS, if the source build fails or predict
@@ -268,3 +304,17 @@ Verify deployment via health check — response includes git branch/commit:
 ```shell
 curl http://localhost:3001/health
 ```
+
+### Daily ASR collector
+
+```shell
+sudo cp /opt/yt-validator/deploy/yt-validator-asr-collect.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now yt-validator-asr-collect.timer
+systemctl list-timers yt-validator-asr-collect.timer
+sudo journalctl -u yt-validator-asr-collect -n 50
+```
+
+Check the unit's `ExecStart` uses the same Python as `yt-validator`
+(`systemctl cat yt-validator`). The collector does nothing until `/predict` has
+written `data/asr_queue.csv`.
