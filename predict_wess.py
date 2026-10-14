@@ -4,21 +4,23 @@ Precision-first cascade, each tier only fires above a cutoff tuned on a
 temporal holdout of labeled history (same triage philosophy as pipeline.py):
 
   1. CHANNEL  - the channel's historical claims all carry one language_id
-  2. TITLE    - the title contains a validated language-name rule
-                (Anglicized names from sheets_language_families.csv plus
-                native-name aliases mined from history, e.g. "bahasa melayu jambi");
-                when several languages are named, the longest name wins, and
-                the last-named breaks a tie
-  3. FASTTEXT - supervised fastText classifier trained on historical
+  2. TITLE    - ChatGPT reads the title and picks one WESS id from every name
+                in sheets_language_families.csv, with a stated confidence;
+                answers are cached per title in data/title_llm_cache.jsonl
+  3. ASR      - YouTube's automatic-caption language, read from the caption
+                cache, trusted only for languages certified one by one
+  4. FASTTEXT - supervised fastText classifier trained on historical
                 (video_title -> language_id) pairs
-  4. LID      - pretrained lid.176 language ID on the title, ISO -> WESS via
+  5. LID      - pretrained lid.176 language ID on the title, ISO -> WESS via
                 the sheets mapping, ambiguous ISO resolved by history frequency
-  5. REVIEW   - no tier confident enough; route to manual review
+  6. REVIEW   - no tier confident enough; route to manual review
 
 Training requires --history (an all_claims export with language_id). The fitted
 signals and tuned cutoffs are cached to wess_artifact.json + wess_fasttext.ftz;
 delete both to retrain. Rows whose video_id appears in --eval-labels are
-excluded from training so the evaluation stays honest.
+excluded from training so the evaluation stays honest. TITLE needs
+OPENAI_API_KEY for titles its cache has not seen; without it, it answers from
+the cache only.
 """
 import argparse
 import hashlib
@@ -44,12 +46,20 @@ PRECISION_TARGET = 0.95   # per-tier precision required on the tuning set
 MIN_BUCKET_N = 25         # a tier must fire at least this often on the tuning set
 VAL_DAYS = 120            # temporal-holdout fallback when no reviewed batch is given
 CASCADE = ['CHANNEL', 'TITLE', 'ASR', 'FASTTEXT', 'LID']
-MAX_TITLE_WORDS = 3       # longest phrase matched in a title, and indexed from a name
+TITLE_LLM_MODEL = 'gpt-5-mini'  # OPENAI_MODEL overrides it at training; the artifact pins the
+                                # model its cutoff was certified on, and prediction uses that one
+TITLE_LLM_BATCH = 25      # titles per request: the ~14k-token language list is the same in
+                          # every request, so OpenAI's prompt cache bills it at a discount
+TITLE_LLM_WORKERS = 8     # requests in flight; a monthly batch is ~3,500 titles, ~140 requests
+TITLE_LLM_LIMIT = 5000    # uncached titles sent per PHASE (tuning, prediction); 0 = cache only
+TITLE_LLM_RETRIES = 3     # the SDK's own retries for a rate limit or a 5xx
+TITLE_LLM_MAX_FAILURES = 5  # failed requests in a row that mean an outage
+TITLE_CACHE_PATH = BASE_DIR / 'data' / 'title_llm_cache.jsonl'
 ASR_MIN_PER_LANG = 25     # tuning rows an ASR language needs before it is judged
                           # (matches MIN_BUCKET_N: 5/5 passes on luck alone)
 ASR_PRECISION = 0.95      # ...and the precision it must reach to be trusted - the same bar as
-                          # every other tier: ASR runs before FASTTEXT (~92% held out) and may
-                          # override TITLE, so a lower bar would trade accuracy for coverage
+                          # every other tier: ASR runs before FASTTEXT (~92% held out), so a
+                          # lower bar would trade accuracy for coverage
 ASR_DEFAULT_LIMIT = 100   # captions.list lookups per PHASE - tuning and prediction each get
                           # this many. 50 quota units per lookup, so a full run costs at most
                           # 2 x 100 x 50 = 10,000 units: exactly the daily key that production
@@ -125,60 +135,36 @@ def norm_title(title):
     return ' '.join(text.split())
 
 
-def canon_phrase(text):
-    """Lowercased words of a phrase, sorted, so word order stops mattering.
-
-    A language name is a set of words, not a sequence: the sheet says "Haitian
-    Creole" and a title may say "Creole Haitian". Both canonicalise to
-    "creole haitian" and match the same rule.
-    """
-    return ' '.join(sorted(re.findall(r'\w+', str(text).lower())))
-
-
-def title_phrases(title, max_words=MAX_TITLE_WORDS):
-    """All 1..max_words word n-grams of the title, canonicalised, longest first."""
-    tokens = re.findall(r'\w+', str(title).lower())
-    for n in range(min(max_words, len(tokens)), 0, -1):
-        for i in range(len(tokens) - n + 1):
-            yield ' '.join(sorted(tokens[i:i + n]))
-
-
 # Every column of the sheet that carries a name a person might type in a title.
 # Anglicized_name is the display name; the others are the production name
 # ("LESSER ANTILLEAN CREOLE FRENCH"), the World Christian Database name, and the
-# dialect. Titles use all of them, so all of them are matchable.
+# dialect. Titles use all of them, so the TITLE prompt lists all of them.
 NAME_COLUMNS = ('Anglicized_name', 'Language_JFProd', 'Language_name_WCD', 'Dialect_name')
 
 
 def load_mapping():
-    """sheets_language_families.csv -> (wess2name, name2wess, iso2wess).
+    """sheets_language_families.csv -> (wess2name, wess_names, iso2wess).
 
-    name2wess indexes each name AND its 2..MAX_TITLE_WORDS word windows, every
-    key canonicalised by canon_phrase(), because titles reorder and abbreviate:
-    "Creole French Lesser Antillean" never equals "Lesser Antillean Creole
-    French" as a string, but names the same language and shares its words.
+    wess_names holds every distinct name the sheet gives a language, display
+    name first, for the TITLE prompt.
     """
     sheet = pandas.read_csv(SHEETS_PATH, dtype=str).fillna('')
-    wess2name, name2wess, iso2wess = {}, defaultdict(set), defaultdict(set)
+    wess2name, wess_names, iso2wess = {}, defaultdict(list), defaultdict(set)
     for _, row in sheet.iterrows():
         wess = norm_lang(row['WESS_LAN_num'])
         if not wess:
             continue
         display = row.get('Anglicized_name', '').strip()
         wess2name.setdefault(wess, display)
+        names = wess_names[wess]
         for column in NAME_COLUMNS:
-            name = str(row.get(column, '')).strip().lower()
-            if len(name) < 3:  # blank or near-blank names would match everything
-                continue
-            name2wess[canon_phrase(name)].add(wess)
-            tokens = re.findall(r'\w+', name)
-            for n in range(2, min(MAX_TITLE_WORDS, len(tokens)) + 1):
-                for i in range(len(tokens) - n + 1):
-                    name2wess[' '.join(sorted(tokens[i:i + n]))].add(wess)
+            name = str(row.get(column, '')).strip()
+            if name and name.lower() not in {n.lower() for n in names}:
+                names.append(name)
         iso = row['ISO_lang'].strip().lower()
         if iso:
             iso2wess[iso].add(wess)
-    return wess2name, dict(name2wess), dict(iso2wess)
+    return wess2name, dict(wess_names), dict(iso2wess)
 
 
 def load_history(path, exclude_video_ids=()):
@@ -204,6 +190,42 @@ def load_history(path, exclude_video_ids=()):
     return df
 
 
+def read_jsonl(path):
+    """Records of an append-only JSON-lines log; nothing if the log is absent."""
+    path = Path(path)
+    if not path.exists():
+        return
+    with open(path, encoding='utf-8') as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except ValueError:   # a line cut short by a crash mid-write
+                continue
+
+
+def append_jsonl(path, records):
+    """Append records to a JSON-lines log."""
+    if not records:
+        return
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # A crash mid-write can leave the last line without its newline. Start a new
+    # line, so the torn record is the only one lost.
+    torn = False
+    if path.exists() and path.stat().st_size:
+        with open(path, 'rb') as handle:
+            handle.seek(-1, os.SEEK_END)
+            torn = handle.read(1) != b'\n'
+    with open(path, 'a', encoding='utf-8') as handle:
+        if torn:
+            handle.write('\n')
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + '\n')
+
+
 # ---------------------------------------------------------------------------
 # Tier 1: channel unanimity
 # ---------------------------------------------------------------------------
@@ -220,84 +242,247 @@ def build_channel_map(df, min_count):
 
 
 # ---------------------------------------------------------------------------
-# Tier 2: title language-name rules
+# Tier 2: ChatGPT reads the title
 # ---------------------------------------------------------------------------
-def title_match_stats(df, phrases):
-    """phrase -> Counter(true language) over titles containing the phrase."""
-    stats = defaultdict(Counter)
-    for title, lang in zip(df['video_title'], df['lang']):
-        seen = set()
-        for phrase in title_phrases(title):
-            if phrase in phrases and phrase not in seen:
-                stats[phrase][lang] += 1
-                seen.add(phrase)
-    return stats
+TITLE_INSTRUCTIONS = """\
+You identify the language a YouTube video is spoken in, from its title alone.
+
+The videos are uploads of the JESUS film and other Jesus Film Project media,
+dubbed into thousands of languages and dialects. A title may name the language
+in English ("JESUS - Haitian Creole"), name it in its own words ("Bahasa Melayu
+Jambi"), or simply be written in it. A language the title names outweighs the
+language the title is written in. When a title names several, choose the most
+specific: a dialect over its language, a language over its family.
+
+The user message is a JSON list of {"i": number, "title": text}. Answer every i
+exactly once. wess_id is the id of exactly one language from the list below, or
+null when the title does not tell you which language the video is in.
+confidence is the probability, from 0 to 1, that wess_id is exactly right; keep
+it low when choosing between close dialects or guessing from the script alone.
+
+Each line of the list is "id: name; other name; ...".
+"""
+
+# Strict structured output. The ids cannot be an enum - 1,954 values is over
+# OpenAI's limit - so title_answer() checks them instead.
+TITLE_SCHEMA = {
+    'type': 'object',
+    'properties': {'answers': {'type': 'array', 'items': {
+        'type': 'object',
+        'properties': {'i': {'type': 'integer'},
+                       'wess_id': {'type': ['string', 'null']},
+                       'confidence': {'type': 'number'}},
+        'required': ['i', 'wess_id', 'confidence'],
+        'additionalProperties': False}}},
+    'required': ['answers'],
+    'additionalProperties': False,
+}
 
 
-def mine_bahasa_aliases(df):
-    """Candidate native-name phrases: 1-3 words following 'bahasa' in titles."""
-    pattern = re.compile(r'bahasa((?:\s+\w+){1,3})')
-    phrases = set()
-    for title in df['video_title']:
-        match = pattern.search(str(title).lower())
-        if match:
-            words = match.group(1).split()
-            for n in range(1, len(words) + 1):
-                phrases.add(canon_phrase('bahasa ' + ' '.join(words[:n])))
-    return phrases
+def title_prompt(wess_names):
+    """The system prompt: the instructions, then every language the sheet names."""
+    lines = [f'{wess}: {"; ".join(names)}'
+             for wess, names in sorted(wess_names.items(), key=lambda kv: int(kv[0]))]
+    return TITLE_INSTRUCTIONS + '\n' + '\n'.join(lines)
 
 
-def build_title_rules(name2wess, wess_freq, train_df, cfg):
-    """phrase -> (language_id, confidence). Only rules the history supports.
+def title_model():
+    """The model a retrain certifies: OPENAI_MODEL, else TITLE_LLM_MODEL."""
+    return os.environ.get('OPENAI_MODEL') or TITLE_LLM_MODEL
 
-    Rules come from two sources: Anglicized names in the sheets mapping and
-    mined 'bahasa X' native-name phrases. A rule is kept when history shows it
-    precise (>= min_n matches at >= min_prec precision, retargeted to the
-    majority label), or - for mapping names never seen in history - when the
-    name is long and unambiguous enough to trust on its own.
+
+def title_fingerprint(model, prompt):
+    """Names one model + prompt pair. Cached answers are only reused under the
+    pair that gave them, so a new model, new wording or a new sheet starts fresh."""
+    return hashlib.sha256(f'{model}\n{prompt}'.encode()).hexdigest()[:12]
+
+
+def title_key(title):
+    """A title as the cache keys it: stripped, '' when missing."""
+    return title.strip() if isinstance(title, str) else ''
+
+
+def openai_stop_reason(exc):
+    """Why every later request would fail the same way, or '' if the next might work."""
+    import openai
+    if isinstance(exc, (openai.AuthenticationError, openai.PermissionDeniedError,
+                        openai.NotFoundError)):
+        return type(exc).__name__
+    if getattr(exc, 'code', None) == 'insufficient_quota':   # out of credit, not a rate limit
+        return 'insufficient_quota'
+    return ''
+
+
+def title_languages(titles, model, prompt, api_key, status=None, report=None, save=None):
+    """title -> (wess_id, confidence) exactly as the model answered.
+
+    A None wess_id is an answer - the title does not say - and is returned like
+    any other; whether an answer is trusted is the tuned cutoff's job, and
+    whether its id is real is checked when it is read (title_answer). A request
+    that failed returns nothing for its titles: a failure is not an answer, and
+    caching one would stop those titles ever being asked again. An auth,
+    permission, unknown-model or billing error stops the run, since every later
+    request would fail the same way.
+
+    `save` is called with each request's answers as they arrive, so a crash
+    loses only the requests in flight. Pass a dict as `report` to learn how the
+    run ended: requests, failed, stopped (None, 'key' or 'outage'), reason, and
+    token usage.
     """
-    candidates = {n for n in name2wess if len(n) >= 3}
-    candidates |= mine_bahasa_aliases(train_df)
-    stats = title_match_stats(train_df, candidates)
+    import threading
+    import openai
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    rules = {}
-    for phrase in candidates:
-        counts = stats.get(phrase)
-        if counts and sum(counts.values()) >= cfg['min_n']:
-            lang, hits = counts.most_common(1)[0]
-            total = sum(counts.values())
-            if hits / total >= cfg['min_prec']:
-                rules[phrase] = (lang, round(hits / total, 4))
-        elif cfg['keep_unseen'] and phrase in name2wess and len(phrase) >= cfg['min_len_unseen']:
-            targets = name2wess[phrase]
-            lang = max(targets, key=lambda w: wess_freq.get(w, 0))
-            rules[phrase] = (lang, 0.9)
-    return rules
+    client = openai.OpenAI(api_key=api_key, max_retries=TITLE_LLM_RETRIES)
+    # Set on a stop. Workers check it before sending, and set it themselves on a
+    # key or billing error, so a bad key costs the requests in flight, not a pool's worth more.
+    stop = threading.Event()
+    sent = []
+    # gpt-5 and the o-series reason before answering; naming a language needs little of it
+    extra = {'reasoning_effort': 'minimal'} if model.startswith(('gpt-5', 'o')) else {}
+    response_format = {'type': 'json_schema',
+                       'json_schema': {'name': 'title_languages', 'strict': True,
+                                       'schema': TITLE_SCHEMA}}
+
+    def ask(batch):
+        if stop.is_set():
+            return None
+        sent.append(batch)
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{'role': 'system', 'content': prompt},
+                          {'role': 'user', 'content': json.dumps(
+                              [{'i': k, 'title': t} for k, t in enumerate(batch)],
+                              ensure_ascii=False)}],
+                response_format=response_format, **extra)
+        except Exception as exc:
+            if openai_stop_reason(exc):
+                stop.set()
+            raise
+        message = response.choices[0].message
+        if getattr(message, 'refusal', None):
+            raise ValueError(f'refused: {message.refusal}')
+        answers = json.loads(message.content)['answers']
+        if sorted(a['i'] for a in answers) != list(range(len(batch))):
+            raise ValueError(f'answered {len(answers)} of {len(batch)} titles')
+        return {batch[a['i']]: (a['wess_id'], a['confidence']) for a in answers}, response.usage
+
+    batches = [titles[k:k + TITLE_LLM_BATCH] for k in range(0, len(titles), TITLE_LLM_BATCH)]
+    out, usage = {}, Counter()
+    failed = consecutive = 0
+    stopped, reason = None, ''
+    with ThreadPoolExecutor(TITLE_LLM_WORKERS) as pool:
+        futures = {pool.submit(ask, batch): batch for batch in batches}
+        for future in as_completed(futures):
+            if future.cancelled():
+                continue
+            try:
+                result = future.result()
+            except Exception as exc:
+                if stopped:   # the cause is already reported; requests in flight fail with it
+                    continue
+                failed += 1
+                consecutive += 1
+                error = f'{type(exc).__name__}: {exc}'[:200]
+                halt = openai_stop_reason(exc)
+                if halt or consecutive >= TITLE_LLM_MAX_FAILURES:
+                    stopped, reason = ('key', halt) if halt else ('outage', error)
+                    stop.set()
+                    for other in futures:
+                        other.cancel()
+                    if status:
+                        status(f'  TITLE: stopped ({error}); titles not yet answered are left unrecorded')
+                elif status:
+                    status(f'  TITLE: a request for {len(futures[future])} titles failed '
+                           f'({error}); left unrecorded')
+                continue
+            if result is None:   # skipped: the run had already stopped
+                continue
+            answers, used = result
+            consecutive = 0
+            out.update(answers)
+            if used is not None:
+                details = getattr(used, 'prompt_tokens_details', None)
+                usage['prompt'] += used.prompt_tokens or 0
+                usage['cached'] += getattr(details, 'cached_tokens', 0) or 0
+                usage['completion'] += used.completion_tokens or 0
+            if save:
+                save(answers)
+    tally = {} if report is None else report
+    tally.update({'requests': len(sent), 'failed': failed,
+                  'stopped': stopped, 'reason': reason, 'usage': dict(usage)})
+    return out
 
 
-def apply_title_rules(title, rules, max_words=MAX_TITLE_WORDS):
-    """When a title names several languages, the most specific one wins.
+def load_title_cache(fingerprint, path=None):
+    """title -> (wess_id, confidence) for every answer this model + prompt gave.
 
-    Phrases are matched by canon_phrase(), so word order does not matter. A
-    longer matching phrase names a narrower language and is preferred:
-    "Haitian Creole French" is Haitian, not French. Where two phrases are the
-    same length the last-named wins, because uploaders put the specific
-    language after the family ("Creole French Haitian" is also Haitian).
+    Like the caption cache, an append-only JSON-lines log of what the model
+    said, never a judgement on it. Answers given under another fingerprint stay
+    in the log but are not used.
     """
-    tokens = re.findall(r'\w+', str(title).lower())
-    best, answers = None, set()
-    for n in range(min(max_words, len(tokens)), 0, -1):
-        for i in range(len(tokens) - n + 1):
-            phrase = ' '.join(sorted(tokens[i:i + n]))
-            if phrase in rules:
-                answers.add(rules[phrase][0])
-                if best is None or (n, i + n) > best[:2]:
-                    best = (n, i + n, phrase)
-    if best is None:
-        return None
-    # third element: the title named several languages, so the key above had to
-    # choose - ASR is consulted on exactly these rows (see predict()).
-    return (*rules[best[2]], len(answers) > 1)
+    return {record['title']: (record.get('wess_id'), record.get('confidence'))
+            for record in read_jsonl(path or TITLE_CACHE_PATH)
+            if record.get('prompt') == fingerprint}
+
+
+def fill_title_cache(titles, cache, model, prompt, api_key=None, limit=0, status=None, path=None):
+    """Ask the model about at most `limit` of these titles the cache lacks.
+
+    Needs an API key; without one the cache is returned as it is. Every answer
+    is appended to the log as it arrives, so a title is only paid for once.
+    """
+    missing = [t for t in dict.fromkeys(map(title_key, titles)) if t and t not in cache]
+    if not (api_key and missing and limit > 0):
+        return cache
+    fingerprint = title_fingerprint(model, prompt)
+
+    def save(answers):
+        stamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        append_jsonl(path or TITLE_CACHE_PATH, [
+            {'title': title, 'wess_id': wess, 'confidence': confidence, 'model': model,
+             'prompt': fingerprint, 'fetched_at': stamp}
+            for title, (wess, confidence) in answers.items()])
+        cache.update(answers)
+
+    asked = missing[:limit]
+    report = {}
+    title_languages(asked, model, prompt, api_key, status, report, save)
+    if status:
+        used = report['usage']
+        status(f'  TITLE: asked {model} about {len(asked)} titles in {report["requests"]} '
+               f'requests ({report["failed"]} failed); tokens {used.get("prompt", 0):,} prompt '
+               f'({used.get("cached", 0):,} cached), {used.get("completion", 0):,} completion')
+        if len(missing) > limit:
+            status(f'  TITLE: {len(missing) - limit} more uncached titles are over the limit '
+                   f'of {limit}; they stay unanswered this run')
+    return cache
+
+
+def title_tier(artifact):
+    """The artifact's certified TITLE tier, or None.
+
+    An artifact trained before TITLE moved to ChatGPT holds a name-rule TITLE
+    tier with no model or prompt; it is ignored until a retrain replaces it.
+    """
+    tier = (artifact or {}).get('tiers', {}).get('TITLE')
+    if tier and 'prompt_id' in tier and 'title_prompt' in artifact:
+        return tier
+    return None
+
+
+def title_answer(cache, title, wess2name):
+    """A title's cached answer -> (wess_id, confidence), or (None, 0.0) when there
+    is none, the model said the title does not tell, or the id is not a WESS id."""
+    wess, confidence = cache.get(title_key(title), (None, 0.0))
+    wess = norm_lang(wess)
+    if wess not in wess2name:
+        return None, 0.0
+    try:
+        return wess, float(confidence)
+    except (TypeError, ValueError):
+        return None, 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -566,42 +751,15 @@ def load_asr_cache(path=None):
     a judgement on it: whether a code is trusted is decided at certification, so
     a language certified later can use answers fetched months earlier.
     """
-    path = Path(path or ASR_CACHE_PATH)
-    cache = {}
-    if path.exists():
-        with open(path, encoding='utf-8') as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except ValueError:   # a line cut short by a crash mid-write
-                    continue
-                cache[record['video_id']] = record['code']
-    return cache
+    return {record['video_id']: record['code'] for record in read_jsonl(path or ASR_CACHE_PATH)}
 
 
 def append_asr_cache(answers, path=None):
     """Append fetched answers to the cache log."""
-    if not answers:
-        return
-    path = Path(path or ASR_CACHE_PATH)
-    path.parent.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
-    # A crash mid-write can leave the last line without its newline. Start a new
-    # line, so the torn record is the only one lost.
-    torn = False
-    if path.exists() and path.stat().st_size:
-        with open(path, 'rb') as handle:
-            handle.seek(-1, os.SEEK_END)
-            torn = handle.read(1) != b'\n'
-    with open(path, 'a', encoding='utf-8') as handle:
-        if torn:
-            handle.write('\n')
-        for video_id, code in answers.items():
-            handle.write(json.dumps({'video_id': video_id, 'code': code,
-                                     'fetched_at': stamp}) + '\n')
+    append_jsonl(path or ASR_CACHE_PATH,
+                 [{'video_id': video_id, 'code': code, 'fetched_at': stamp}
+                  for video_id, code in answers.items()])
 
 
 def fill_asr_cache(video_ids, cache, api_key=None, limit=0, status=None, path=None, report=None):
@@ -636,8 +794,9 @@ def collection_rank(triage, licensed):
 def asr_collection_order(df, artifact=None):
     """Video ids of a scored queue, in the order the collector should look them up.
 
-    Rows CHANNEL or TITLE already answer are skipped - except contested titles,
-    which ASR may overrule. The rest go claims likely to be approved first
+    Rows CHANNEL or TITLE already answer are skipped; TITLE's answers are read
+    from the title cache /predict filled, so the collector never calls OpenAI.
+    The rest go claims likely to be approved first
     (AUTO_Y, then REVIEW, then the auto-rejected), most-viewed first within each:
     a language is only used on an approved claim, and approved claims are also
     the rows that certify languages. The auto-rejected and licensed rows still
@@ -648,17 +807,17 @@ def asr_collection_order(df, artifact=None):
     artifact = artifact or {}
     tiers = artifact.get('tiers', {})
     cmap = artifact.get('channel_map', {}) if 'CHANNEL' in tiers else {}
-    rules = ({k: tuple(v) for k, v in artifact.get('title_rules', {}).items()}
-             if 'TITLE' in tiers else {})
+    title = title_tier(artifact)
+    title_cache = load_title_cache(title['prompt_id']) if title else {}
+    wess2name = artifact.get('wess2name', {})
     ranked = []
     for position, row in enumerate(df.to_dict('records')):
         channel = row.get('channel_id')
         if isinstance(channel, str) and channel in cmap:
             continue
-        title = row.get('video_title')
-        if rules and isinstance(title, str):
-            match = apply_title_rules(title, rules)
-            if match and not match[2]:
+        if title_cache:
+            wess, confidence = title_answer(title_cache, row.get('video_title'), wess2name)
+            if wess is not None and confidence >= title['cutoff']:
                 continue
         licensed = str(row.get('licensed', '')).strip().lower() in TRUTHY
         views = pandas.to_numeric(row.get('views'), errors='coerce')
@@ -751,7 +910,7 @@ def in_calibration_half(video_id):
 
 
 def train(history_path, status, exclude_video_ids=(), calib_df=None, asr_key=None,
-          asr_limit=ASR_DEFAULT_LIMIT):
+          asr_limit=ASR_DEFAULT_LIMIT, openai_key=None, title_limit=TITLE_LLM_LIMIT):
     """Fit signals on labeled history and tune per-tier cutoffs.
 
     Cutoffs are tuned on the calibration half of a reviewed batch when one is
@@ -760,7 +919,7 @@ def train(history_path, status, exclude_video_ids=(), calib_df=None, asr_key=Non
     holdout of history is easier than real monthly leftovers. Without a
     reviewed batch it falls back to the most recent VAL_DAYS of history.
     """
-    wess2name, name2wess, iso2wess = load_mapping()
+    wess2name, wess_names, iso2wess = load_mapping()
 
     status(f'Loading labeled history from {history_path}')
     df = load_history(history_path, exclude_video_ids)
@@ -807,31 +966,35 @@ def train(history_path, status, exclude_video_ids=(), calib_df=None, asr_key=Non
                                          f'(min_count={min_count}, fired {n})',
                                'val_precision': round(prec, 4), 'val_n': n}
 
-    # ---- TITLE: among configs meeting the target, widest coverage wins
-    title_cfgs = [
-        {'min_n': 5, 'min_prec': 0.95, 'keep_unseen': False, 'min_len_unseen': 5},
-        {'min_n': 3, 'min_prec': 0.9, 'keep_unseen': False, 'min_len_unseen': 5},
-        {'min_n': 3, 'min_prec': 0.9, 'keep_unseen': True, 'min_len_unseen': 5},
-    ]
-    best_title = None
-    last_title_prec, last_title_n = 0.0, 0
-    for cfg in title_cfgs:
-        rules = build_title_rules(name2wess, wess_freq, fit_df, cfg)
-        prec, n = measure([(match[0] if (match := apply_title_rules(t, rules)) else None, t_lang)
-                           for t, t_lang in zip(tune_df['video_title'], truth)])
-        status(f'  TITLE {cfg}: {len(rules)} rules, precision {prec:.3f} on {n}')
-        if n > last_title_n:
-            last_title_prec, last_title_n = prec, n
-        if n >= MIN_BUCKET_N and prec >= PRECISION_TARGET:
-            if best_title is None or n > best_title['val_n']:
-                best_title = {'cfg': cfg, 'val_precision': round(prec, 4), 'val_n': n}
-    if best_title:
-        tiers['TITLE'] = best_title
-        disabled.pop('TITLE', None)
+    # ---- TITLE: ChatGPT names the language; its stated confidence is tuned like
+    # any model's probability. The model and prompt are pinned in the artifact,
+    # since the cutoff only holds for the pair it was tuned on.
+    title_model_name, title_text = title_model(), title_prompt(wess_names)
+    fingerprint = title_fingerprint(title_model_name, title_text)
+    titles = [title_key(t) for t in tune_df['video_title']]
+    title_cache = load_title_cache(fingerprint)
+    if openai_key or any(t in title_cache for t in titles):
+        fill_title_cache(titles, title_cache, title_model_name, title_text, openai_key,
+                         title_limit, status)
+        answered = sum(1 for t in titles if t in title_cache)
+        status(f'  TITLE: {answered} of {len(titles)} tuning titles have a {title_model_name} answer')
+        preds = [title_answer(title_cache, t, wess2name) for t in titles]
+        tuned = tune_prob_cutoff([p for p, _ in preds], [c for _, c in preds], truth)
+        if tuned:
+            cutoff, prec, n = tuned
+            tiers['TITLE'] = {'cutoff': cutoff, 'val_precision': round(prec, 4), 'val_n': n,
+                              'model': title_model_name, 'prompt_id': fingerprint}
+            status(f'  TITLE: cutoff {cutoff:.2f}, precision {prec:.3f} on {n}')
+        else:
+            prec, n = measure([(p, t) for (p, _), t in zip(preds, truth)])
+            disabled['TITLE'] = {'reason': f'no cutoff on the grid reached {PRECISION_TARGET} '
+                                           f'on >= {MIN_BUCKET_N} rows (uncut: {prec:.3f} on {n})',
+                                 'val_precision': round(prec, 4), 'val_n': n}
+            status('  TITLE: no cutoff met the precision target; tier disabled')
     else:
-        disabled['TITLE'] = {'reason': f'no config reached {PRECISION_TARGET} on >= {MIN_BUCKET_N} '
-                                       f'rows (best: {last_title_prec:.3f} on {last_title_n})',
-                             'val_precision': round(last_title_prec, 4), 'val_n': last_title_n}
+        disabled['TITLE'] = {'reason': f'no OPENAI_API_KEY and no cached {title_model_name} '
+                                       f'answers for these titles'}
+        status('  TITLE: no OPENAI_API_KEY and nothing cached; tier disabled')
 
     # ---- ASR: trust the audio, but only for languages whose mapping is safe.
     # Certification reads the caption cache the collector fills during the month,
@@ -916,8 +1079,9 @@ def train(history_path, status, exclude_video_ids=(), calib_df=None, asr_key=Non
     if 'CHANNEL' in tiers:
         artifact['channel_map'] = build_channel_map(df, tiers['CHANNEL']['min_count'])
     if 'TITLE' in tiers:
-        rules = build_title_rules(name2wess, wess_freq_all, df, tiers['TITLE']['cfg'])
-        artifact['title_rules'] = {k: list(v) for k, v in rules.items()}
+        # Prediction sends this exact prompt, so an edit to the sheet or the
+        # instructions cannot reach production until a retrain certifies it.
+        artifact['title_prompt'] = title_text
     if 'LID' in tiers:
         artifact['lid_label_map'] = build_lid_label_map(get_lid_model(), iso2wess, wess_freq_all)
     if 'ASR' in tiers:
@@ -946,14 +1110,14 @@ def load_artifact():
 # ---------------------------------------------------------------------------
 # Prediction
 # ---------------------------------------------------------------------------
-def predict(df, artifact, status, asr_key=None, asr_limit=ASR_DEFAULT_LIMIT):
+def predict(df, artifact, status, asr_key=None, asr_limit=ASR_DEFAULT_LIMIT,
+            openai_key=None, title_limit=TITLE_LLM_LIMIT):
     tiers = artifact['tiers']
     wess2name = artifact['wess2name']
     n = len(df)
     lang = [None] * n
     source = ['REVIEW'] * n
     conf = [np.nan] * n
-    contested = []   # TITLE rows whose title named more than one language
     off = artifact.get('disabled_tiers', {})
     if off:
         status('Tiers not in this artifact: '
@@ -968,22 +1132,31 @@ def predict(df, artifact, status, asr_key=None, asr_limit=ASR_DEFAULT_LIMIT):
             if channel in cmap:
                 assign(i, cmap[channel], 'CHANNEL', 1.0)
 
-    if 'TITLE' in tiers:
-        rules = {k: tuple(v) for k, v in artifact['title_rules'].items()}
-        for i, title in enumerate(df['video_title'].fillna('')):
-            if source[i] == 'REVIEW':
-                match = apply_title_rules(title, rules)
-                if match:
-                    assign(i, match[0], 'TITLE', match[1])
-                    if match[2]:
-                        contested.append(i)
-
     pending = [i for i in range(n) if source[i] == 'REVIEW']
-    # ASR arbitrates the handful of titles that named several languages, and
-    # otherwise answers rows no cheaper tier could. Answers come from the caption
-    # cache the collector fills; --asr only adds live lookups for rows it has not
-    # reached, within --asr-limit, contested titles first.
-    targets = contested + pending
+    tier = title_tier(artifact)
+    if 'TITLE' in tiers and not tier:
+        status('  TITLE: this artifact holds the old name-rule tier; retrain to certify ChatGPT')
+    if tier and pending:
+        # The model and prompt the cutoff was certified on, whatever OPENAI_MODEL says now
+        titles = [title_key(df['video_title'].iloc[i]) for i in pending]
+        distinct = {t for t in titles if t}
+        title_cache = load_title_cache(tier['prompt_id'])
+        cached_before = sum(1 for t in distinct if t in title_cache)
+        fill_title_cache(titles, title_cache, tier['model'], artifact['title_prompt'],
+                         openai_key, title_limit, status)
+        cached = sum(1 for t in distinct if t in title_cache)
+        status(f'  TITLE: {cached} of {len(distinct)} distinct titles have a {tier["model"]} '
+               f'answer ({cached_before} cached, {cached - cached_before} asked now'
+               + ('' if openai_key else '; no OPENAI_API_KEY, so cache only') + ')')
+        for i, title in zip(pending, titles):
+            wess, confidence = title_answer(title_cache, title, wess2name)
+            if wess is not None and confidence >= tier['cutoff']:
+                assign(i, wess, 'TITLE', confidence)
+
+    targets = [i for i in range(n) if source[i] == 'REVIEW']
+    # ASR answers rows no cheaper tier could. Answers come from the caption cache
+    # the collector fills; --asr only adds live lookups for rows it has not
+    # reached, within --asr-limit.
     if 'ASR' in tiers and targets:
         keep = tiers['ASR']['languages']
         iso2wess = artifact['iso2wess']
@@ -1088,7 +1261,7 @@ def read_labels(labels_path, status=None):
     labels = labels[labels['true_lang'].notna() & labels['video_id'].notna()]
     return labels.drop_duplicates('video_id', keep='last')[['video_id', 'true_lang']]
 
-def train_from_exports(history_path, eval_labels, status):
+def train_from_exports(history_path, eval_labels, status, openai_key=None):
     """Monthly retrain from the claims pipeline's own exports.
 
     history_path is the run's all_claims.csv and eval_labels the reviewed verdict
@@ -1096,7 +1269,7 @@ def train_from_exports(history_path, eval_labels, status):
     the queue about to be predicted: the reviewed batch and the new queue barely
     overlap (~2% of videos), so joining the labels onto the queue would leave
     almost nothing to tune on. ASR is certified from the caption cache, with no
-    API calls.
+    API calls; TITLE asks OpenAI about tuning titles its cache lacks.
     """
     import csv
     import sys
@@ -1117,7 +1290,8 @@ def train_from_exports(history_path, eval_labels, status):
     status(f'Retraining languages: {len(calib_df):,} of {len(wanted):,} reviewed claims found in '
            f'{Path(history_path).name} ({100 * len(calib_df) / max(len(wanted), 1):.1f}%)')
     exclude = tuple(set(labels['video_id']) | set(wanted))
-    return train(history_path, status, exclude_video_ids=exclude, calib_df=calib_df)
+    return train(history_path, status, exclude_video_ids=exclude, calib_df=calib_df,
+                 openai_key=openai_key)
 
 
 def report(merged, status):
@@ -1174,13 +1348,22 @@ def main(args, status_callback=print):
     if asr_limit is None:
         asr_limit = ASR_DEFAULT_LIMIT
 
+    from helpers import load_env
+    load_env()
+
     # Live caption lookups cost 50 quota units per video, so they are opt-in.
     # Without --asr the ASR tier still answers from the collector's cache.
     asr_key = None
     if getattr(args, 'asr', False):
-        from helpers import load_env
         load_env(['YT_API_KEY'])
         asr_key = os.environ['YT_API_KEY']
+
+    # TITLE asks OpenAI about titles its cache lacks whenever a key is set;
+    # without one, or with --title-limit 0, it answers from the cache only.
+    openai_key = os.environ.get('OPENAI_API_KEY')
+    title_limit = getattr(args, 'title_limit', None)
+    if title_limit is None:
+        title_limit = TITLE_LLM_LIMIT
 
     df = pandas.read_csv(args.prediction_input, low_memory=False)
 
@@ -1205,10 +1388,12 @@ def main(args, status_callback=print):
             calibrated = len(calib_df) >= 4 * MIN_BUCKET_N
         artifact = train(args.history, status, exclude_video_ids=exclude,
                          calib_df=calib_df, asr_key=asr_key,
-                         asr_limit=asr_limit)
+                         asr_limit=asr_limit, openai_key=openai_key,
+                         title_limit=title_limit)
 
     out = predict(df, artifact, status, asr_key=asr_key,
-                  asr_limit=asr_limit)
+                  asr_limit=asr_limit, openai_key=openai_key,
+                  title_limit=title_limit)
     out.to_csv(args.prediction_output, index=False)
     status(f'Saved predictions to {args.prediction_output}')
 
@@ -1230,6 +1415,10 @@ if __name__ == '__main__':
     parser.add_argument('--asr', action='store_true',
                         help='Also make live caption lookups for rows the cache lacks (50 quota '
                              'units each; needs YT_API_KEY). Without it, ASR answers from the cache only.')
+    parser.add_argument('--title-limit', type=int, default=None,
+                        help=f'Uncached titles sent to OpenAI per phase (tuning, prediction), '
+                             f'default {TITLE_LLM_LIMIT}; 0 answers from data/title_llm_cache.jsonl '
+                             f'only. Needs OPENAI_API_KEY.')
     parser.add_argument('--collect-asr', action='store_true',
                         help='Collector mode: look up the next --asr-limit uncached videos of '
                              '--prediction-input (a scored queue, ideally with triage and views) into '

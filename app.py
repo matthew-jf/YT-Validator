@@ -110,7 +110,8 @@ def _language_state():
             art = predict_wess.load_artifact()
             tiers = art.get('tiers', {})
             _ARTIFACT_MEMO.update(stamp=stamp, value={
-                'tiers_live': [t for t in predict_wess.CASCADE if t in tiers],
+                'tiers_live': [t for t in predict_wess.CASCADE if t in tiers
+                               and (t != 'TITLE' or predict_wess.title_tier(art))],
                 'trusted_asr_languages': sorted(tiers.get('ASR', {}).get('languages', {})),
                 'artifact_trained_at': art.get('metadata', {}).get('trained_at'),
             })
@@ -330,7 +331,8 @@ def retrain_languages(predict_wess, history, eval_labels, status):
         status('Language retrain skipped: no readable language_eval_labels')
         return
     try:
-        predict_wess.train_from_exports(history, present, status)
+        predict_wess.train_from_exports(history, present, status,
+                                        openai_key=os.environ.get('OPENAI_API_KEY'))
     except Exception as exc:
         status(f'Language retrain failed, keeping the previous artifact ({exc})')
 
@@ -340,7 +342,8 @@ def add_language_predictions(output_path, status, history=None, eval_labels=None
     Best effort by design: the verdict output is the deliverable, so a missing
     language artifact or a language-model error is logged and the file is left
     as the verdict model wrote it. Makes no YouTube API calls - ASR answers come
-    only from the collector's cache. When `history` is given (monthly), the
+    only from the collector's cache - but asks OpenAI about titles the title cache
+    lacks when OPENAI_API_KEY is set. When `history` is given (monthly), the
     language model is retrained from the pipeline's exports first.
     """
     try:
@@ -357,7 +360,8 @@ def add_language_predictions(output_path, status, history=None, eval_labels=None
         if not predict_wess.ARTIFACT_PATH.exists():
             status('Language prediction skipped: no wess_artifact.json')
             return
-        out = predict_wess.predict(scored, predict_wess.load_artifact(), status)
+        out = predict_wess.predict(scored, predict_wess.load_artifact(), status,
+                                   openai_key=os.environ.get('OPENAI_API_KEY'))
         out.to_csv(output_path, index=False)
     except Exception as exc:
         status(f'Language prediction skipped ({exc})')
