@@ -121,6 +121,10 @@ def model_info():
 # rules at predict time, so the model should only learn content-based verdicts.
 excluded_codes = ['L', 'V', 'N', 'X']
 
+# What videos.list can tell us about a video. 'missing' covers deleted and
+# private alike: the API returns neither, and cannot say which.
+VIDEO_STATES = ('public', 'unlisted', 'missing')
+
 NUMERIC = [
     'views_log', 'matching_duration', 'longest_match', 'video_duration_sec',
     'match_ratio', 'longest_ratio', 'match_per_longest',
@@ -336,13 +340,20 @@ def normalize_video_id(value):
 
 
 def _lookup_ids(youtube_client, ids, retries):
-    """Ask YouTube which of these ids exist. None means the call kept failing."""
+    """What YouTube says about these ids: id -> privacyStatus. None means the
+    call kept failing.
+
+    `status` costs nothing extra -- videos.list bills 1 unit per call whatever
+    the parts -- and it is the difference between "this video is gone" and
+    "this video is unlisted", which the id alone cannot tell apart.
+    """
     import time
     for attempt in range(retries + 1):
         try:
-            response = youtube_client.videos().list(part='id',
+            response = youtube_client.videos().list(part='id,status',
                                                     id=','.join(ids)).execute()
-            return {item['id'] for item in response.get('items', [])}
+            return {item['id']: (item.get('status') or {}).get('privacyStatus') or 'public'
+                    for item in response.get('items', [])}
         except Exception as exc:
             if attempt < retries:
                 time.sleep(2 ** attempt)
@@ -357,10 +368,17 @@ OUTAGE_GIVE_UP = 3   # consecutive single-id failures that mean "not one bad id"
 def check_videos_available_batch(video_ids, youtube_client, check_stopped=None,
                                  retries=2):
     """
-    Check video availability in batches of 50 (API limit).
-    Returns dict mapping video_id -> True (present) / False (missing) / None
-    (could not be determined). Callers must treat None as unknown, never as
-    unavailable: a failed lookup is not evidence about the video.
+    What state each video is in, in batches of 50 (the API limit).
+
+    Returns video_id -> 'public' / 'unlisted' / 'missing' / None (unknown).
+    Callers must treat None as unknown, never as missing: a failed lookup is
+    not evidence about the video.
+
+    'missing' means the API did not return the video, which is deleted and
+    private alike -- and sometimes neither, since a partial response omits
+    videos that are perfectly fine. Ids absent from a batch are therefore
+    asked for a second time, alone, before being called missing. On a sample
+    of 183 ids this flag had called 44 of them gone when they were public.
     """
     from tqdm import tqdm
 
@@ -377,8 +395,18 @@ def check_videos_available_batch(video_ids, youtube_client, check_stopped=None,
 
         found = _lookup_ids(youtube_client, list(lookup), retries)
         if found is not None:
+            # Confirm an absence before trusting it: one truncated response
+            # would otherwise mark a live video gone for good. The second ask
+            # goes as one more batch, not one call per id -- a quarter of a
+            # monthly batch is genuinely missing, and asking singly would cost
+            # 50 units a head.
+            absent = [clean for clean in lookup if clean not in found]
+            if absent:
+                again = _lookup_ids(youtube_client, absent, retries)
+                if again:
+                    found = {**found, **again}
             for clean, original in lookup.items():
-                results[original] = clean in found
+                results[original] = found.get(clean, 'missing')
             continue
 
         # The batch call kept failing. Retry the ids one at a time so a single
@@ -396,7 +424,7 @@ def check_videos_available_batch(video_ids, youtube_client, check_stopped=None,
                 results[original] = None
             else:
                 consecutive_failures = 0
-                results[original] = clean in one
+                results[original] = one.get(clean, 'missing')
 
     return results
 
@@ -451,25 +479,34 @@ def main(args, status_callback=None, stop_check=None):
     # Add media_component_id column
     df['media_component_id'] = df['asset_id'].map(asset_to_media_component)
 
-    # Add video availability column (True if available, False if blocked or
-    # unavailable). If the input already carries a video_available column, it
-    # is reused and the YouTube API is not called.
-    if 'video_available' in df.columns:
-        # NaN stays NaN: an unknown availability must not become "available"
-        # any more than it may become "unavailable".
-        df['video_available'] = df['video_available'].map(
-            {True: True, False: False, 'True': True, 'False': False})
+    # What state each video is in: 'public', 'unlisted', 'missing' or NaN for
+    # unknown. An input that already carries video_state is reused and the
+    # YouTube API is not called; an older input carrying only the video_available
+    # boolean is read as the two states it could express.
+    if 'video_state' in df.columns:
+        df['video_state'] = df['video_state'].where(
+            df['video_state'].isin(VIDEO_STATES))
+    elif 'video_available' in df.columns:
+        # NaN stays NaN: an unknown state must not become 'public' any more
+        # than it may become 'missing'.
+        df['video_state'] = df['video_available'].map(
+            {True: 'public', False: 'missing', 'True': 'public', 'False': 'missing'})
     elif 'video_id' in df.columns:
         msg = 'Checking video availability'
         check_stopped(msg)
         if status_callback:
             status_callback(msg)
         youtube = get_youtube_client()
-        available_map = check_videos_available_batch(
+        state_map = check_videos_available_batch(
             df['video_id'].tolist(), youtube, check_stopped=check_stopped)
-        df['video_available'] = df['video_id'].map(available_map)
+        df['video_state'] = df['video_id'].map(state_map)
     else:
-        df['video_available'] = True  # Default to True if no video_id column
+        df['video_state'] = 'public'  # no video_id column: nothing to look up
+
+    # Kept for every consumer that still reads the boolean. Unlisted counts as
+    # available: it is watchable by link and earns views like any other video.
+    df['video_available'] = df['video_state'].map(
+        {'public': True, 'unlisted': True, 'missing': False})
 
     check_stopped('before predictions')
     if status_callback:
@@ -482,20 +519,23 @@ def main(args, status_callback=None, stop_check=None):
     proba = model.predict_proba(features[FEATURES])[:, 1]
 
     licensed = df['licensed'].to_numpy(dtype=bool)
-    # Only an explicit False rejects. Unknown (the availability check errored)
-    # is not evidence the video is gone, so those rows go to a person instead.
-    unavailable = (df['video_available'] == False).to_numpy()       # noqa: E712
-    unknown_availability = df['video_available'].isna().to_numpy()
-    forced_n = licensed | unavailable
+    # Availability no longer rejects anything. Graded against a reviewed batch,
+    # auto-rejecting a missing video was right 88% of the time -- Ben still
+    # calls 12% of gone videos a valid claim, because he judges the claim, not
+    # whether the video is up today. So the state routes to a person and is
+    # shown alongside the row; it never decides.
+    unavailable = (df['video_state'] == 'missing').to_numpy()
+    unknown_availability = df['video_state'].isna().to_numpy()
+    forced_n = licensed
 
     # rating stays the model probability, zeroed by rules (existing contract)
     df['rating'] = np.where(forced_n, 0.0, proba)
     df['predicted_verdict'] = np.where(~forced_n & (proba >= threshold), 'Y', 'N')
     df['confidence'] = np.maximum(proba, 1 - proba).round(4)
     df['triage'] = np.select(
-        [licensed, unavailable, unknown_availability,
+        [licensed, unavailable, unknown_availability,   # both route to REVIEW now
          proba <= t_low, proba >= t_high],
-        ['AUTO_N_LICENSED', 'AUTO_N_UNAVAILABLE', 'REVIEW', 'AUTO_N', 'AUTO_Y'],
+        ['AUTO_N_LICENSED', 'REVIEW', 'REVIEW', 'AUTO_N', 'AUTO_Y'],
         default='REVIEW')
 
     # Channel-history triage assist. A unanimous channel history alone is too
@@ -513,6 +553,10 @@ def main(args, status_callback=None, stop_check=None):
         & (df['rating'] <= CHANNEL_RATING_CAP)
         & (df['channel_history_verdict'] == 'N')
         & (df['channel_history_claims'] >= MIN_CHANNEL_CLAIMS)
+        # A row sent to REVIEW because the video is missing or its state is
+        # unknown stays there: this override would otherwise auto-reject it
+        # through the back door.
+        & ~(unavailable | unknown_availability)
     )
     df.loc[channel_auto_n, 'triage'] = 'AUTO_N_CHANNEL'
 

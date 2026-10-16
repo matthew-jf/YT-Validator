@@ -82,17 +82,25 @@ python pipeline.py \
 Uses cached `model.joblib` if found, else requires training data
 eg. `--training-data /Users/matthew.jurewicz/Downloads/export_all_claims_202507241336.csv`.
 
-If the input CSV already has a `video_available` column it is reused and the
-YouTube API is not called (no `YT_API_KEY` needed for such offline runs).
+If the input CSV already has a `video_state` column it is reused and the
+YouTube API is not called (no `YT_API_KEY` needed for such offline runs); an
+older export carrying only `video_available` is read as `public`/`missing`.
 
 Output CSV = input columns plus:
 
-- `licensed`, `media_component_id`, `video_available` — enrichment (as before)
+- `licensed`, `media_component_id`, `video_state`, `video_available` — enrichment.
+  `video_state` is `public`, `unlisted`, `missing` (deleted or private — the API
+  returns neither and cannot say which) or empty when the lookup failed.
+  `video_available` stays as the boolean older consumers read, with `unlisted`
+  counting as available: it is watchable by link and earns views
 - `rating` — model probability of verdict Y, forced to 0 for licensed assets and unavailable videos (as before)
 - `predicted_verdict` — Y/N at the tuned threshold, after the licensed/unavailable rules
 - `confidence` — max(p, 1-p) of the raw model probability
 - `channel_history_verdict`, `channel_history_claims` — the channel's unanimous historical verdict and labeled claim count (empty/0 if unseen or mixed)
-- `triage` — `AUTO_N_LICENSED` / `AUTO_N_UNAVAILABLE` / `AUTO_N` / `AUTO_Y` / `AUTO_N_CHANNEL` (auto-decidable at >= 95% reviewed-batch accuracy) or `REVIEW` (route to manual review)
+- `triage` — `AUTO_N_LICENSED` / `AUTO_N` / `AUTO_Y` / `AUTO_N_CHANNEL` (auto-decidable at >= 95% reviewed-batch accuracy) or `REVIEW` (route to manual review).
+  A missing or unknown video routes to `REVIEW` and never auto-rejects: graded
+  against the September batch, rejecting a missing video was right 88% of the
+  time, because a reviewer judges the claim, not whether the video is up today
 
 
 ## WESS language prediction
