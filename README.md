@@ -65,6 +65,8 @@ Or export required envs:
 
 ```shell
 YT_API_KEY=AIza...                # Grab free from GCP console - 1 unit per 50 videos capped at 10k units/day.
+OPENAI_API_KEY=sk-...             # WESS TITLE tier (predict_wess.py); without it TITLE answers from its cache only
+OPENAI_MODEL=gpt-5-mini           # optional; the model a language retrain certifies
 ```
 
 ## CLI 
@@ -80,17 +82,173 @@ python pipeline.py \
 Uses cached `model.joblib` if found, else requires training data
 eg. `--training-data /Users/matthew.jurewicz/Downloads/export_all_claims_202507241336.csv`.
 
-If the input CSV already has a `video_available` column it is reused and the
-YouTube API is not called (no `YT_API_KEY` needed for such offline runs).
+If the input CSV already has a `video_state` column it is reused and the
+YouTube API is not called (no `YT_API_KEY` needed for such offline runs); an
+older export carrying only `video_available` is read as `public`/`missing`.
 
 Output CSV = input columns plus:
 
-- `licensed`, `media_component_id`, `video_available` — enrichment (as before)
+- `licensed`, `media_component_id`, `video_state`, `video_available` — enrichment.
+  `video_state` is `public`, `unlisted`, `missing` (deleted or private — the API
+  returns neither and cannot say which) or empty when the lookup failed.
+  `video_available` stays as the boolean older consumers read, with `unlisted`
+  counting as available: it is watchable by link and earns views
 - `rating` — model probability of verdict Y, forced to 0 for licensed assets and unavailable videos (as before)
 - `predicted_verdict` — Y/N at the tuned threshold, after the licensed/unavailable rules
 - `confidence` — max(p, 1-p) of the raw model probability
 - `channel_history_verdict`, `channel_history_claims` — the channel's unanimous historical verdict and labeled claim count (empty/0 if unseen or mixed)
-- `triage` — `AUTO_N_LICENSED` / `AUTO_N_UNAVAILABLE` / `AUTO_N` / `AUTO_Y` / `AUTO_N_CHANNEL` (auto-decidable at >= 95% reviewed-batch accuracy) or `REVIEW` (route to manual review)
+- `triage` — `AUTO_N_LICENSED` / `AUTO_N` / `AUTO_Y` / `AUTO_N_CHANNEL` (auto-decidable at >= 95% reviewed-batch accuracy) or `REVIEW` (route to manual review).
+  A missing or unknown video routes to `REVIEW` and never auto-rejects: graded
+  against the September batch, rejecting a missing video was right 88% of the
+  time, because a reviewer judges the claim, not whether the video is up today
+
+
+## WESS language prediction
+
+`predict_wess.py` predicts the WESS `language_id` (the number entered in the
+monthly sheet, `WESS_LAN_num` in `sheets_language_families.csv`) for
+unprocessed claims. Precision-first cascade — a tier only fires when its
+cutoff, calibrated to >= 95% precision, is met; everything else is `REVIEW`:
+
+1. `CHANNEL` — the channel's labeled history is unanimous (min claim count is tuned)
+2. `TITLE` — ChatGPT (`gpt-5-mini` by default) reads the title and picks one
+   WESS id from a list of every language in the sheet, under every name the sheet
+   gives it (`Anglicized_name`, `Language_JFProd`, `Language_name_WCD`,
+   `Dialect_name`), or says the title doesn't tell. It reads titles that name the
+   language in English, name it natively ("bahasa melayu jambi"), or are simply
+   written in it, and prefers the most specific dialect named. Its stated
+   confidence gets a cutoff like any model's probability. Titles go 25 to a
+   request, and every answer is kept in `data/title_llm_cache.jsonl`, so a title
+   is paid for once; retraining re-reads the cache. A retrain pins the model and
+   the exact prompt in the artifact, and prediction uses those, so a changed sheet,
+   prompt or `OPENAI_MODEL` takes effect only after the next retrain certifies it.
+   Without `OPENAI_API_KEY`, TITLE answers from the cache only
+3. `ASR` — YouTube's automatic captions for the video, ISO -> WESS. A lookup
+   costs 50 quota units, cannot be batched, and shares the 10,000/day key with
+   production, so lookups are made by a daily collector and kept in a cache
+   (see *Caption cache and daily collector*); training and prediction read the
+   cache and spend nothing. ASR answers claims no cheaper tier answered. It is
+   trusted **per language**: one ASR label often spans many WESS ids (`id` covers Djambi,
+   Malaysian, North Moluccan Malay...), so certification measures each language
+   separately — grouped by base code, `es-419` counts as `es` — and trusts only
+   those reaching `ASR_PRECISION` on at least `ASR_MIN_PER_LANG` (25) rows. The
+   training log also shows each language's base rate and lift, so a language that
+   merely dominates the batch is visible. A failed lookup is never cached as "no
+   captions", and a quota or key error stops the run. Measured on 150 fresh
+   July held-out lookups (Sept 2026): 81% returned a track; `es` 27/27, `hi`
+   20/22, `en` 10/11, `id` 4/41.
+4. `FASTTEXT` — supervised fastText classifier over channel-prior tokens
+   (channel's top historical languages, leave-one-out at fit time) + title text
+5. `LID` — pretrained lid.176 language ID on the title, ISO -> WESS via the
+   sheets mapping, ambiguous codes resolved by history frequency
+
+Train (builds `wess_artifact.json` + `wess_fasttext.ftz`; delete both to
+retrain) and evaluate against a completed monthly sheet:
+
+```shell
+python predict_wess.py \
+  --prediction-input unprocessed_claims.csv \
+  --history all_claims.csv \
+  --eval-labels "Unprocessed_ClaimsMCN_Matt_JULY(1).csv"
+```
+
+When `--eval-labels` is present at training time, per-tier cutoffs are
+calibrated on a stable half of that reviewed batch (rows whose video_id also
+appears in history are excluded from training) and scored on the other half —
+same recalibration philosophy as the verdict model's triage cutoffs. July 2026
+batch, held-out half: `CHANNEL` 24/24 = 100%, `FASTTEXT` 124/128 = 96.9%,
+total 97.4% accuracy at 28.3% coverage of language-labeled claims. `TITLE`
+(then name rules, since replaced by ChatGPT) and `LID` did not meet the
+precision bar on that batch and disabled themselves.
+
+Predict-only runs reuse the cached artifacts (~1s for a monthly batch, no
+`--history` needed):
+
+```shell
+python predict_wess.py --prediction-input unprocessed_claims.csv
+```
+
+Output CSV = input columns plus:
+
+- `predicted_language_id` — WESS number, empty when routed to review
+- `predicted_language_name` — Anglicized name from the sheets mapping
+- `language_source` — `CHANNEL` / `TITLE` / `ASR` / `FASTTEXT` / `LID` / `REVIEW`
+- `language_confidence` — 1.0 for `CHANNEL`, ChatGPT's stated confidence for
+  `TITLE`, the language's certified precision for `ASR`, model probability otherwise
+
+### Caption cache and daily collector
+
+`data/asr_cache.jsonl` is an append-only log of every answered caption lookup:
+`video_id`, the ASR language code (`''` when the video has no usable track) and
+when it was fetched. It records what YouTube said, never whether to trust it, so
+a language certified later can use answers fetched earlier.
+
+Each `/predict` call writes its scored batch to `data/asr_queue.csv` and adds the
+language columns above to the output (best effort: a language error never fails
+the verdict run). The collector works through that batch once a day:
+
+```shell
+python predict_wess.py --collect-asr --prediction-input data/asr_queue.csv   # 180 lookups by default
+```
+
+It skips rows CHANNEL or TITLE already answer (TITLE's answers read from the
+title cache `/predict` filled, so the collector never calls OpenAI) and
+anything cached, then looks up likely approvals first — `AUTO_Y`, then `REVIEW`,
+then rows with no triage, then the near-certain N (`AUTO_N*` or a `licensed`
+asset) — most-viewed first within each. `triage` and `licensed` are optional:
+the daily ingest export carries neither, and then order is views alone. 180 lookups is 9,000
+units, leaving room for the verdict pipeline's availability checks (~48 units per
+run).
+
+The workflow across both services:
+
+```
+DAILY    evidence only, nothing decided
+  YouTube a3 report -> claims pipeline ingest (06:00 UTC) -> POST /asr/queue
+    -> data/asr_queue.csv -> collector (08:15 UTC, 180 lookups) -> data/asr_cache.jsonl
+
+MONTHLY  the decision, fed by that cache
+  Ben's verdicts -> pipeline POST /predict + language_history + language_eval_labels
+    -> certify ASR languages from the cache (zero quota) -> verdict model + language cascade
+    -> CSV back to the pipeline -> Drive -> Ben
+
+CONSOLE  browser cannot reach the VM, so the pipeline proxies
+  console -> pipeline /api/claims-ingest/status -> localhost:3001/asr/status
+```
+
+Cadence and budget live in two different places, deliberately: the **cadence** is
+the systemd timer (`OnCalendar=*-*-* 08:15:00 UTC`, after the Pacific quota
+reset), and the **budget** is `ASR_DAILY_LIMIT` (180) in `predict_wess.py`, used
+whenever `--asr-limit` is omitted. The limit is per invocation, not per calendar
+day: a manual run spends on top of the timer's. Nothing can read YouTube's
+remaining quota — the API does not expose it — so "9,000 of 10,000" is our own
+arithmetic and assumes nothing else drew on the key.
+
+Rates measured on the live queue (16 Sep 2026): claims arrive at ~110/day (107-125
+depending on the window, from `claim_created_date`). How many need a lookup depends
+on which tiers are live, because rows CHANNEL or TITLE answer are skipped. With the
+deployed artifact (CHANNEL + FASTTEXT, TITLE self-disabled on the July batch)
+99.5% need one, so ~110 lookups/day, net progress ~70/day against the 180 budget,
+and the 4,405-video backlog clears in ~63 days. With TITLE live about 90% need one:
+~99/day, ~54 days. Ben's verdicts remove claims from the queue before the collector
+reaches them, so both are pessimistic bounds.
+
+`GET /asr/status` is a cheap, pollable view for the claims console: queue rows
+and whether the export carried `licensed`/`triage`, cache split (with and without
+a caption track), the collector's last run (`looked_up`, `added`, `failed`,
+`remaining`, `budget`, `stopped_reason` — `null`, `quota` or `outage`), live tiers
+and trusted ASR languages, and branch/commit. It reads files only — line counts,
+the collector's status JSON and the artifact re-parsed only when it changes — so
+polling stays cheap as the cache grows. `remaining` is as of the last collector
+run, not recomputed per request.
+
+Monthly cycle: when the reviewed batch comes back, retrain with it as
+`--eval-labels`. ASR certification reads the cache for the tuning half, and the
+other half grades it.
+
+`lid.176.ftz` is downloaded automatically on first use. fastText comes from
+pip (see `environment.yml`); on macOS, if the source build fails or predict
+raises a numpy-2 copy error, `pip install fasttext-wheel "numpy<2"`.
 
 
 ## API
@@ -195,3 +353,17 @@ Verify deployment via health check — response includes git branch/commit:
 ```shell
 curl http://localhost:3001/health
 ```
+
+### Daily ASR collector
+
+```shell
+sudo cp /opt/yt-validator/deploy/yt-validator-asr-collect.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now yt-validator-asr-collect.timer
+systemctl list-timers yt-validator-asr-collect.timer
+sudo journalctl -u yt-validator-asr-collect -n 50
+```
+
+Check the unit's `ExecStart` uses the same Python as `yt-validator`
+(`systemctl cat yt-validator`). The collector does nothing until `/predict` has
+written `data/asr_queue.csv`.

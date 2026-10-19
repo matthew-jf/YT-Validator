@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the ASR caption collector once a day, after YouTube's quota reset
+
+[Timer]
+# The Data API quota resets at midnight Pacific: 07:00 UTC in summer, 08:00 UTC
+# in winter. 08:15 UTC is past the reset all year round.
+OnCalendar=*-*-* 08:15:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
