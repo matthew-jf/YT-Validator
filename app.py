@@ -297,18 +297,43 @@ def write_asr_queue(df, queue_path=ASR_QUEUE_PATH):
     os.replace(tmp_path, queue_path)
 
 
+def carry_over_labelled(incoming, previous):
+    """Labelled rows of `previous` that still need a caption lookup, up to the cap.
+
+    `incoming` is the latest batch, which is freshly ingested and so unlabelled.
+    Replacing the queue with it alone drops every labelled row, and those are the
+    only rows that can certify the ASR tier - a caption is judged by comparing it
+    against a human language. That is how 3,602 lookups ended up with none of the
+    tuning set: the queue never held a labelled row long enough to be reached.
+    Rows already in the cache are left out, so the cap buys lookups, not re-reads.
+    """
+    if 'language_id' not in previous.columns:
+        return None
+    import predict_wess
+    labelled = previous[previous['language_id'].map(predict_wess.norm_lang).notna()]
+    if labelled.empty:
+        return None
+    cached = predict_wess.load_asr_cache()
+    keep = labelled[~labelled['video_id'].map(predict_wess.normalize_id).isin(cached)]
+    keep = keep[~keep['video_id'].isin(set(incoming['video_id']))]
+    return keep.head(predict_wess.ASR_CERTIFY_CAP) if not keep.empty else None
+
+
 def merge_asr_queue(incoming, queue_path=ASR_QUEUE_PATH):
-    """Make `incoming` the collector's queue, carrying over triage it already knows."""
+    """Make `incoming` the collector's queue, carrying over triage and labelled rows."""
     if 'video_id' not in incoming.columns:
         raise ValueError('queue file has no video_id column')
-    if 'triage' not in incoming.columns and os.path.exists(queue_path):
-        previous = pd.read_csv(queue_path, low_memory=False,
-                               usecols=lambda column: column in ('video_id', 'triage'))
-        if 'triage' in previous.columns:
+    if os.path.exists(queue_path):
+        previous = pd.read_csv(queue_path, low_memory=False)
+        if 'triage' not in incoming.columns and 'triage' in previous.columns:
             known = (previous.dropna(subset=['triage'])
                      .drop_duplicates('video_id', keep='last')
                      .set_index('video_id')['triage'])
             incoming = incoming.assign(triage=incoming['video_id'].map(known))
+        carried = carry_over_labelled(incoming, previous)
+        if carried is not None:
+            incoming = pd.concat([incoming, carried.reindex(columns=incoming.columns)],
+                                 ignore_index=True)
     write_asr_queue(incoming, queue_path)
     return len(incoming)
 
