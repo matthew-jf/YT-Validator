@@ -306,6 +306,8 @@ def carry_over_labelled(incoming, previous):
     against a human language. That is how 3,602 lookups ended up with none of the
     tuning set: the queue never held a labelled row long enough to be reached.
     Rows already in the cache are left out, so the cap buys lookups, not re-reads.
+    The cap counts every labelled row the queue ends up with, including any
+    `incoming` already carries, so a second call cannot push the total past it.
     """
     if 'language_id' not in previous.columns:
         return None
@@ -313,10 +315,50 @@ def carry_over_labelled(incoming, previous):
     labelled = previous[previous['language_id'].map(predict_wess.norm_lang).notna()]
     if labelled.empty:
         return None
+    already = (incoming['language_id'].map(predict_wess.norm_lang).notna().sum()
+               if 'language_id' in incoming.columns else 0)
+    room = predict_wess.ASR_CERTIFY_CAP - int(already)
+    if room <= 0:
+        return None
     cached = predict_wess.load_asr_cache()
     keep = labelled[~labelled['video_id'].map(predict_wess.normalize_id).isin(cached)]
     keep = keep[~keep['video_id'].isin(set(incoming['video_id']))]
-    return keep.head(predict_wess.ASR_CERTIFY_CAP) if not keep.empty else None
+    return keep.head(room) if not keep.empty else None
+
+
+def seed_asr_queue_from_labels(predict_wess, eval_labels, status, queue_path=ASR_QUEUE_PATH):
+    """Put Ben's newly labelled rows in the collector's queue.
+
+    carry_over_labelled keeps labelled rows the queue already holds, but nothing
+    put them there: both writers are fed freshly ingested claims, which carry no
+    language yet. The verdict sheets are where labels actually arrive, so the
+    monthly retrain that reads them seeds the queue from them too. A sheet gives
+    only video_id and language_id; that is enough, because collection_rank sorts
+    a labelled row first whatever else is missing.
+    """
+    if not os.path.exists(queue_path):
+        return
+    frames = []
+    for path in predict_wess.label_paths(eval_labels):
+        if not os.path.exists(path):
+            continue
+        try:
+            frames.append(predict_wess.read_verdict_sheet(path))
+        except Exception as exc:
+            status(f'ASR queue seed: {os.path.basename(path)} unreadable, ignored ({exc})')
+    if not frames:
+        return
+    sheets = pd.concat(frames, ignore_index=True)
+    if 'video_id' not in sheets.columns:
+        return
+    queue = pd.read_csv(queue_path, low_memory=False)
+    extra = carry_over_labelled(queue, sheets)
+    if extra is None:
+        status('ASR queue seed: every labelled row is already queued or cached')
+        return
+    write_asr_queue(pd.concat([queue, extra.reindex(columns=queue.columns)],
+                              ignore_index=True), queue_path)
+    status(f'ASR queue seed: added {len(extra)} labelled rows for ASR certification')
 
 
 def merge_asr_queue(incoming, queue_path=ASR_QUEUE_PATH):
@@ -380,6 +422,9 @@ def add_language_predictions(output_path, status, history=None, eval_labels=None
         merge_asr_queue(scored)
 
         import predict_wess
+        if eval_labels:
+            # Before the retrain, so next month can certify ASR on these rows.
+            seed_asr_queue_from_labels(predict_wess, eval_labels, status)
         if history:
             retrain_languages(predict_wess, history, eval_labels, status)
         elif eval_labels:
