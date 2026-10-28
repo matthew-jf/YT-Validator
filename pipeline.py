@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import sys
 import threading
@@ -339,6 +340,41 @@ def normalize_video_id(value):
     return str(value).strip().lstrip("'")
 
 
+# Reasons no amount of retrying will fix: the key is spent, wrong, or barred.
+# Everything else (a 5xx, a rate limit, a dropped connection) is worth retrying.
+FATAL_API_REASONS = {'quotaExceeded', 'quotaExceeded402', 'dailyLimitExceeded',
+                     'dailyLimitExceeded402', 'dailyLimitExceededUnreg',
+                     'variableTermLimitExceeded', 'variableTermExpiredDailyExceeded',
+                     'keyInvalid', 'keyExpired', 'accessNotConfigured', 'forbidden'}
+
+
+class AvailabilityLookupStopped(Exception):
+    """The API refused in a way that retrying cannot fix. Carries the reason."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _api_error_reason(exc):
+    """The API's reason code ('quotaExceeded', ...) from an HttpError.
+
+    HttpError.reason is the human-readable message, not the code, so the code
+    comes from the response body.
+    """
+    content = getattr(exc, 'content', None)
+    if content is None:
+        return ''
+    try:
+        error = json.loads(content.decode('utf-8'))['error']
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return ''
+    for item in list(error.get('errors') or []) + list(error.get('details') or []):
+        if isinstance(item, dict) and item.get('reason'):
+            return item['reason']
+    return ''
+
+
 def _lookup_ids(youtube_client, ids, retries):
     """What YouTube says about these ids: id -> privacyStatus. None means the
     call kept failing.
@@ -355,6 +391,12 @@ def _lookup_ids(youtube_client, ids, retries):
             return {item['id']: (item.get('status') or {}).get('privacyStatus') or 'public'
                     for item in response.get('items', [])}
         except Exception as exc:
+            reason = _api_error_reason(exc)
+            if reason in FATAL_API_REASONS:
+                # Quota does not come back in two seconds, and a bad key never
+                # does. Stop the whole lookup rather than spend ~800 doomed
+                # calls discovering it one batch at a time.
+                raise AvailabilityLookupStopped(reason) from exc
             if attempt < retries:
                 time.sleep(2 ** attempt)
             else:
@@ -383,6 +425,7 @@ def check_videos_available_batch(video_ids, youtube_client, check_stopped=None,
     from tqdm import tqdm
 
     results = {}
+    stopped_reason = None
     batch_size = 50
     num_batches = min(int(len(video_ids) / batch_size), 10000) + 1
     msg = 'Checking video availability'
@@ -390,10 +433,16 @@ def check_videos_available_batch(video_ids, youtube_client, check_stopped=None,
     for i in tqdm(range(0, len(video_ids), batch_size), total=num_batches, desc=msg):
         if check_stopped:
             check_stopped(msg)
+        if stopped_reason:
+            break
         batch = video_ids[i:i + batch_size]
         lookup = {normalize_video_id(v): v for v in batch}
 
-        found = _lookup_ids(youtube_client, list(lookup), retries)
+        try:
+            found = _lookup_ids(youtube_client, list(lookup), retries)
+        except AvailabilityLookupStopped as stop:
+            stopped_reason = stop.reason
+            break
         if found is not None:
             # Confirm an absence before trusting it: one truncated response
             # would otherwise mark a live video gone for good. The second ask
@@ -418,7 +467,11 @@ def check_videos_available_batch(video_ids, youtube_client, check_stopped=None,
             if consecutive_failures >= OUTAGE_GIVE_UP:
                 results[original] = None
                 continue
-            one = _lookup_ids(youtube_client, [clean], retries=0)
+            try:
+                one = _lookup_ids(youtube_client, [clean], retries=0)
+            except AvailabilityLookupStopped as stop:
+                stopped_reason = stop.reason
+                break
             if one is None:
                 consecutive_failures += 1
                 results[original] = None
@@ -426,7 +479,9 @@ def check_videos_available_batch(video_ids, youtube_client, check_stopped=None,
                 consecutive_failures = 0
                 results[original] = one.get(clean, 'missing')
 
-    return results
+    # Everything not reached stays out of `results`, so the caller reads it as
+    # unknown and routes it to a person -- never as a missing video.
+    return results, stopped_reason
 
 
 def main(args, status_callback=None, stop_check=None):
@@ -497,9 +552,19 @@ def main(args, status_callback=None, stop_check=None):
         if status_callback:
             status_callback(msg)
         youtube = get_youtube_client()
-        state_map = check_videos_available_batch(
+        state_map, stopped_reason = check_videos_available_batch(
             df['video_id'].tolist(), youtube, check_stopped=check_stopped)
         df['video_state'] = df['video_id'].map(state_map)
+        if stopped_reason:
+            # Say so loudly and in the file: a batch where every row is unknown
+            # and goes to review otherwise looks like a model that gave up.
+            unchecked = int(df['video_state'].isna().sum())
+            note = (f'availability lookup stopped: {stopped_reason} '
+                    f'({unchecked} of {len(df)} rows unchecked)')
+            df.loc[df['video_state'].isna(), 'video_state_note'] = note
+            print(note)
+            if status_callback:
+                status_callback(note)
     else:
         df['video_state'] = 'public'  # no video_id column: nothing to look up
 

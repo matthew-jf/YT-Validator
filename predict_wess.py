@@ -66,6 +66,9 @@ ASR_DEFAULT_LIMIT = 100   # captions.list lookups per PHASE - tuning and predict
                           # shares. Uncapped, tuning alone would ask for 8 days of quota.
 ASR_DAILY_LIMIT = 180     # lookups per day for the collector: 9,000 of the 10,000 units, leaving
                           # room for the verdict pipeline's availability checks (~48 per run)
+ASR_CERTIFY_CAP = 1500  # labelled rows the queue carries for certification: enough to
+                        # judge the top dozen languages at ASR_MIN_PER_LANG, and it drains
+                        # in ~8 days at ASR_DAILY_LIMIT, so prediction is not starved for long
 ASR_CACHE_PATH = BASE_DIR / 'data' / 'asr_cache.jsonl'
 ASR_STATUS_PATH = BASE_DIR / 'data' / 'asr_collector_status.json'
 # fastText is reproducible only with a fixed seed AND one thread: its threads update the
@@ -777,8 +780,13 @@ def fill_asr_cache(video_ids, cache, api_key=None, limit=0, status=None, path=No
     return cache
 
 
-def collection_rank(triage, licensed):
-    """Lower sorts first: approved, then to review, then no triage, then near-certain N.
+def collection_rank(triage, licensed, labelled=False):
+    """Lower sorts first: labelled, then approved, then to review, then no triage, then near-certain N.
+
+    A labelled row already has a human language, so its caption can never improve
+    a prediction - it is the only thing that can certify the ASR tier, which needs
+    ASR_MIN_PER_LANG rows per language before it may be trusted. Nothing else in
+    the queue buys that, so these go first.
 
     A licensed asset is force-rejected by the verdict model, and a rejected claim
     never needs a language - but these go last, not never: reviewers approved 3.1%
@@ -786,6 +794,8 @@ def collection_rank(triage, licensed):
     no triage at all (the daily ingest export carries none) sort ahead of the
     auto-rejected, because an unknown row is likelier to need an answer.
     """
+    if labelled:
+        return -1
     if licensed or str(triage or '').startswith('AUTO_N'):
         return 3
     return TRIAGE_PRIORITY.get(triage, 2)
@@ -812,16 +822,19 @@ def asr_collection_order(df, artifact=None):
     wess2name = artifact.get('wess2name', {})
     ranked = []
     for position, row in enumerate(df.to_dict('records')):
+        # A labelled row is wanted for certification, not prediction, so the
+        # tiers that already answer it are no reason to skip it.
+        labelled = norm_lang(row.get('language_id')) is not None
         channel = row.get('channel_id')
-        if isinstance(channel, str) and channel in cmap:
+        if not labelled and isinstance(channel, str) and channel in cmap:
             continue
-        if title_cache:
+        if not labelled and title_cache:
             wess, confidence = title_answer(title_cache, row.get('video_title'), wess2name)
             if wess is not None and confidence >= title['cutoff']:
                 continue
         licensed = str(row.get('licensed', '')).strip().lower() in TRUTHY
         views = pandas.to_numeric(row.get('views'), errors='coerce')
-        ranked.append((collection_rank(row.get('triage'), licensed),
+        ranked.append((collection_rank(row.get('triage'), licensed, labelled),
                        -(0.0 if pandas.isna(views) else float(views)),
                        position, normalize_id(row.get('video_id'))))
     return list(dict.fromkeys(video_id for *_, video_id in sorted(ranked) if video_id))
