@@ -374,8 +374,10 @@ def add_language_predictions(output_path, status, history=None, eval_labels=None
     try:
         scored = pd.read_csv(output_path, low_memory=False)
         # Hand the batch to the collector first, so a failure below cannot stop
-        # the caption lookups that next month's certification depends on.
-        write_asr_queue(scored)
+        # the caption lookups that next month's certification depends on. Goes
+        # through merge_asr_queue, not write_asr_queue: a plain write would drop
+        # the labelled rows the queue is carrying for certification.
+        merge_asr_queue(scored)
 
         import predict_wess
         if history:
