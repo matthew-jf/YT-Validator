@@ -858,12 +858,19 @@ def collect_asr(df, api_key, limit, status, artifact=None, path=None, status_pat
     fill_asr_cache(order, cache, api_key, limit, status, path, report)
     after = sum(1 for v in order if v in cache)
     left = len(order) - after
+    # A labelled row is in the queue to certify a language, not to be answered,
+    # so the console reports it apart. Cached ones leave the queue on the next
+    # write, making this the backlog, never the total collected.
+    labelled = set(df[df['language_id'].map(norm_lang).notna()]['video_id']
+                   .map(normalize_id)) if 'language_id' in df.columns else set()
+    left_labelled = sum(1 for v in order if v not in cache and v in labelled)
     write_collector_status({
         'last_run': datetime.now(timezone.utc).isoformat(timespec='seconds'),
         'looked_up': report.get('looked_up', 0),
         'added': after - before,
         'failed': report.get('failed', 0),
         'remaining': left,
+        'remaining_labelled': left_labelled,
         'queue_videos_needing_asr': len(order),
         'budget': limit,
         'stopped_reason': report.get('stopped'),
