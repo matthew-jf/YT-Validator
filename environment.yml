@@ -13,3 +13,11 @@ dependencies:
   - tqdm
   - python-dotenv
   - flask
+  - pip
+  - pip:
+      # WESS language predictor (predict_wess.py). On macOS, if the source
+      # build fails or predict() raises a numpy-2 copy error, use:
+      #   pip install fasttext-wheel "numpy<2"
+      - fasttext
+      # TITLE tier: ChatGPT reads the title (predict_wess.py)
+      - openai
